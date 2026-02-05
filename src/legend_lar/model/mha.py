@@ -23,7 +23,7 @@ class MHA(nn.Module):
 
     def forward(self, x: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
         qkv = self.Wqkv(x)
-        qkv = qkv.view(qkv.shape[0], 3, self.num_heads, self.head_dim).contiguous()
-        out = self.attn(qkv, causal=self.causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).reshape(out.shape[0], self.d_model)
+        qkv = qkv.view(-1, 3, self.num_heads, self.head_dim).contiguous()
+        out = self.attn(qkv, causal=self.causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).reshape(-1, self.emb_dim)
         out = self.out_proj(out)
         return out

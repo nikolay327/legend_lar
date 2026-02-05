@@ -42,7 +42,7 @@ class ResidualAdaLNModulator(nn.Module):
             gate = 1 + self.gate_tanh_scale * torch.tanh(gate_raw)
         else:
             gate = 1 + gate_raw
-        return gate[:, None, :]
+        return gate # (B, 1)
 
     def _split(self, mod: Tensor) -> Tuple[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
         # Attn branch modulation parameters
@@ -70,11 +70,10 @@ class ResidualAdaLNModulator(nn.Module):
 
         (s1, b1, g1_raw), (s2, b2, g2_raw) = self._split(mod)
 
-        # Broadcast to (B, 1, D)
-        s1 = s1[:, None, :] # scale for attn LN output
-        b1 = b1[:, None, :] # shift for attn LN output
-        s2 = s2[:, None, :] # scale for mlp LN output
-        b2 = b2[:, None, :] # scale for mlp LN output
+        # s1 scale for attn LN output
+        # b1 shift for attn LN output
+        # s2 scale for mlp LN output
+        # b2 scale for mlp LN output
 
         # Scalar gates to (B, 1, 1)
         g1 = self._gate(g1_raw) # scalar gate for attn residual branch

@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -87,4 +88,5 @@ class NRatioEstimator(nn.Module):
         return self.Wlogit(pooled)
 
     def tokenize_then_forward(self, x: Tensor, gE: Tensor):
-        return self.forward(*pack_data(x, gE, zero_token_id=self.config.num_sipms))
+        g, E, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)
+        return self.forward(g.to(torch.long), E.to(torch.float32), b_all.to(torch.long), t_all.to(torch.long), k_all.to(torch.long), cu_seqlens.to(torch.int32), max_seqlen, lengths.to(torch.long))
