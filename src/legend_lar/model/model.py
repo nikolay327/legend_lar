@@ -58,7 +58,7 @@ class NRatioEstimator(nn.Module):
         cu_seqlens: Tensor, # (N+1,)
         max_seqlen: int,
         lengths: Tensor # (N,)
-    ):
+    ) -> Tensor:
         e_g = self.hpge_emb(g) # (N, D)
         e_E = self.hpge_energy_emb(E) # (N, D)
 
