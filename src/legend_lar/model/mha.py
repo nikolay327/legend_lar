@@ -1,0 +1,29 @@
+
+from torch import Tensor
+import torch.nn as nn
+from flash_attn.modules.mha import FlashSelfAttention
+
+class MHA(nn.Module):
+    def __init__(
+        self,
+        emb_dim: int,
+        num_heads: int,
+        causal: bool = False
+    ):
+        super(MHA, self).__init__()
+
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = self.emb_dim // self.num_heads
+        self.causal = causal
+
+        self.attn = FlashSelfAttention(causal=self.causal)
+        self.Wqkv = nn.Linear(self.emb_dim, 3 * self.emb_dim, bias=False)
+        self.out_proj = nn.Linear(self.emb_dim, self.emb_dim, bias=False)
+
+    def forward(self, x: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
+        qkv = self.Wqkv(x)
+        qkv = qkv.view(qkv.shape[0], 3, self.num_heads, self.head_dim).contiguous()
+        out = self.attn(qkv, causal=self.causal, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).reshape(out.shape[0], self.d_model)
+        out = self.out_proj(out)
+        return out
