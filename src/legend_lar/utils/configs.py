@@ -24,11 +24,14 @@ class ModelConfig:
     num_layers: int = None
     causal: int = None
 
-    hpge_id_and_energy: str
-    data_paths: list[str]
-    prior: list[float]
-    labels: list[int]
-    true_coincidence_label: int
+    hpge_energy_mean: float = None
+    hpge_energy_std: float = None
+
+    hpge_id_and_energy: str = None
+    data_paths: list[str] = None
+    prior: list[float] = None
+    labels: list[int] = None
+    true_coincidence_label: int = None
 
     # Training hyperparams
     local_batch_size: int = None
@@ -45,7 +48,6 @@ class ModelConfig:
     ece_bins: int = None
     n_classes: int = None
 
-    save_to: str = None
     save_to: str = None
 
 @dataclass(frozen=True)

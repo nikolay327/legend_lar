@@ -70,12 +70,16 @@ class LArListDataset(IterableDataset):
     def __init__(
         self,
         hpge_path: str,
-        lar_paths: str,
+        lar_paths: list[str],
         prior: list[float],
         labels: list[int],
         true_coincidence_label: int,
+        hpge_energy_mean: float,
+        hpge_energy_std: float,
         train_val_test_fract: list[float],
         local_batch_size: int,
+        num_t_bins: int,
+        num_sipm_chs: int,
         rng_seed_for_split: int,
         times_of_mixing: int,
         global_rng_seed_for_sampling: int,
@@ -94,8 +98,13 @@ class LArListDataset(IterableDataset):
         self.lar_paths = lar_paths
         self.labels = labels
         self.true_coincidence_label = true_coincidence_label
+        self.hpge_energy_mean = hpge_energy_mean
+        self.hpge_energy_std = hpge_energy_std
+
         self.prior = prior
         self.batch_size = local_batch_size
+        self.num_t_bins = num_t_bins
+        self.num_sipm_chs = num_sipm_chs
         self.global_rng_seed_for_sampling = global_rng_seed_for_sampling
         self.epoch_value = epoch_value
 
@@ -106,6 +115,9 @@ class LArListDataset(IterableDataset):
         self.mode = None  # train (0), val (1), or test (2)
 
         self._set_stratified_batch_sizes()
+        self._set_mixed_indices()
+        self._set_train_val_test_nums()
+        self._set_train_val_test_cumsums()
 
     def _set_stratified_batch_sizes(self):
         """
@@ -122,7 +134,7 @@ class LArListDataset(IterableDataset):
         self.datasets = []
         for i in range(len(self.lar_paths)):
             lar_dataset = LArDataset(
-                mmap_path=self.lar_paths[i],
+                lar_path=self.lar_paths[i],
                 label=self.labels[i],
                 shuffled_indices=self.mixed_indices[i],
                 train_val_test_cumsum=self.train_val_test_cumsums[i],
@@ -133,7 +145,7 @@ class LArListDataset(IterableDataset):
     def _set_mixed_indices(self):
         # Monotonicly increasing default indices
         self.data_lengths = [
-            dataset.data.shape[0] for dataset in self.datasets
+            load_npz(path).shape[0] for path in self.lar_paths
         ]
         mixed_indices = [np.arange(mixing_idx).astype(np.int64) for mixing_idx in self.data_lengths]
 
@@ -167,6 +179,7 @@ class LArListDataset(IterableDataset):
     def _read_hpge_dataset(self):
         """To be called inside each worker since the hpge data is only < 1MB"""
         self.hpge_dataset = open_memmap(self.hpge_path, mode="r").copy()
+        self.hpge_dataset = (self.hpge_dataset - self.hpge_energy_mean) / self.hpge_energy_std
 
     def __len__(self):
         if self.datasets is None:
@@ -180,18 +193,13 @@ class LArListDataset(IterableDataset):
         for dataset in self.datasets:
             dataset._set_worker_id(worker_info.id, worker_info.num_workers)
             dataset._read_data_inside_worker()
+            dataset.set_mode(self.mode)
         self._read_hpge_dataset()
 
-        self._set_mixed_indices()
-        self._set_train_val_test_nums()
-        self._set_train_val_test_cumsums()
-    
     def set_mode(self, mode_idx: int):
         """To be called before DataLoader is intilialized in the main process."""
         assert mode_idx in (0, 1, 2)
         self.mode = mode_idx
-        for dataset in self.datasets:
-            dataset.set_mode(mode_idx)
 
     def set_epoch(self, epoch: int):
         """To be called by the main process at the beginning of each epoch. Epoch value is stored in a multiprocessing.Value."""
@@ -219,13 +227,14 @@ class LArListDataset(IterableDataset):
             for idx in range(len(self)):
                 batch = []
                 labels = []
-                indices = []
+                indices = None
                 break_ = False
                 for dataset in self.datasets:
                     partial_batch, label, indices_shard = dataset[idx]
-                    batch.append(partial_batch)
+                    batch.append(partial_batch.toarray().reshape(-1, self.num_t_bins, self.num_sipm_chs))
                     labels.append(label)
-                    indices.append(indices_shard)
+                    if label[0] == self.true_coincidence_label:
+                        indices = indices_shard
                     if partial_batch is None:
                         break_ = True
                 if break_:
@@ -233,7 +242,7 @@ class LArListDataset(IterableDataset):
 
                 batch = np.concatenate(batch, axis=0)
                 labels = np.concatenate(labels, axis=0)
-                indices = np.array(indices[self.true_coincidence_label], dtype=np.int64)
+                indices = np.array(indices, dtype=np.int64)
                 yield batch, self.hpge_dataset[indices], labels
         except Exception as e:
             self._close_worker_resources()

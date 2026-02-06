@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 import shutil
-import traceback
 from typing import Tuple
 
 import numpy as np
@@ -15,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from torch.amp import autocast
-from apex.optimizers import FusedMixedPrecisionLamb
+from bitsandbytes.optim import LAMB
 
 from legend_lar.model import NRatioEstimator
 from legend_lar.utils import NRETestMetrics, ModelConfig, Paths, load_config, init_config
@@ -63,7 +62,7 @@ class Trainer:
             cp = torch.load(f'{self.config.save_to}/checkpoint_{checkpoint_id}.pt', map_location=self.device)
             self.model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
 
-        self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
+        self.model = torch.compile(self.model, dynamic=True)
 
         if checkpoint_id == 0:
             return None
@@ -90,7 +89,7 @@ class Trainer:
         print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")       
 
     def init_optimizer(self, model_opt_state):
-        self.model_opt = FusedMixedPrecisionLamb(
+        self.model_opt = LAMB(
             params=self.model.parameters(),
             lr = self.config.lr_model,
             betas=self.config.betas_model,
@@ -131,7 +130,9 @@ class Trainer:
         self.model_opt.step()
 
         with torch.no_grad():
-            acc = (F.sigmoid(logits[labels == 1]) > 0.5).mean()
+            acc = (F.sigmoid(logits[labels == 1]) > 0.5).to(torch.float32).sum()
+            acc += (F.sigmoid(logits[labels == 0]) <= 0.5).to(torch.float32).sum()
+            acc = acc / labels.shape[0]
 
         return loss.detach().cpu().item(), acc.detach().cpu().item()
 
@@ -224,7 +225,7 @@ class Trainer:
  
     def train(self, starting_epoch: int, final_epoch: int):
         model_opt_state = self.load_checkpoint(starting_epoch)
-        self.init_optimizer(model_opt_state, starting_epoch)
+        self.init_optimizer(model_opt_state)
 
         for epoch in range(starting_epoch, final_epoch+1):
             self.model.train()
@@ -321,7 +322,7 @@ def train(starting_epoch: int, final_epoch: int, experiment: str, model_name: st
 
     config.data_paths = [str(paths.data_dir / f"{key}.npz") for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
     config.prior = [data_config[key]["prior"] for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
-    config.labels = [data_config[key]["labels"][0] for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
+    config.labels = [data_config[key]["label"] for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
     config.hpge_id_and_energy = data_config["hpge_id_and_energy"]
     config.hpge_id_and_energy = str(paths.data_dir / f'{config.hpge_id_and_energy}.npy')
 
@@ -331,16 +332,19 @@ def train(starting_epoch: int, final_epoch: int, experiment: str, model_name: st
         lar_paths=config.data_paths,
         labels=config.labels,
         true_coincidence_label=config.true_coincidence_label,
+        hpge_energy_mean=config.hpge_energy_mean,
+        hpge_energy_std=config.hpge_energy_std,
         prior=config.prior,
         train_val_test_fract=config.train_val_test_fract,
         local_batch_size=config.local_batch_size,
+        num_t_bins=config.num_sipm_t_bins,
+        num_sipm_chs=config.num_sipms,
         rng_seed_for_split=config.rng_seed_for_split,
         times_of_mixing=config.times_of_mixing,
         global_rng_seed_for_sampling=config.global_rng_seed_for_sampling,
         epoch_value=epoch_value
     )
     collate_fn = CollateFn(
-        num_t_bins=config.num_sipm_t_bins,
         num_sipm_chs=config.num_sipms,
         true_coincidence_label=config.true_coincidence_label,
         cuda_device=device
@@ -357,9 +361,27 @@ def train(starting_epoch: int, final_epoch: int, experiment: str, model_name: st
         worker_init_fn=worker_init_fn,
         collate_fn=collate_fn
     )
-    dataset.set_mode(1)
+
+    val_dataset = LArListDataset(
+        hpge_path=config.hpge_id_and_energy,
+        lar_paths=config.data_paths,
+        labels=config.labels,
+        true_coincidence_label=config.true_coincidence_label,
+        hpge_energy_mean=config.hpge_energy_mean,
+        hpge_energy_std=config.hpge_energy_std,
+        prior=config.prior,
+        train_val_test_fract=config.train_val_test_fract,
+        local_batch_size=config.local_batch_size,
+        num_t_bins=config.num_sipm_t_bins,
+        num_sipm_chs=config.num_sipms,
+        rng_seed_for_split=config.rng_seed_for_split,
+        times_of_mixing=config.times_of_mixing,
+        global_rng_seed_for_sampling=config.global_rng_seed_for_sampling,
+        epoch_value=epoch_value
+    )
+    val_dataset.set_mode(1)
     val_dataloader = DataLoader(
-        dataset=dataset,
+        dataset=val_dataset,
         batch_size=None,
         shuffle=False,
         num_workers=2,

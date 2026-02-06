@@ -5,12 +5,10 @@ from legend_lar.utils import pack_data
 class CollateFn:
     def __init__(
         self,
-        num_t_bins: int,
         num_sipm_chs: int,
         true_coincidence_label: int,
         cuda_device: str = "cpu"
     ):
-        self.num_t_bins = num_t_bins
         self.num_sipm_chs = num_sipm_chs
         self.true_coincidence_label = true_coincidence_label
 
@@ -26,8 +24,6 @@ class CollateFn:
     @torch.no_grad()
     def preprocess(self, batch: Tuple):
         x, gE, labels = batch
-        x = x.toarray().reshape(-1, self.num_t_bins, self.num_sipm_chs)
-
         x = torch.from_numpy(x).to(dtype=torch.float32)
         gE = torch.from_numpy(gE).to(dtype=torch.float32)
         labels = torch.from_numpy(labels).to(dtype=torch.float32)

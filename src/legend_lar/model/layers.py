@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 import torch.nn as nn
+import torch.nn.functional as F
 
 class ResidualAdaLNModulator(nn.Module):
     """
@@ -39,9 +40,9 @@ class ResidualAdaLNModulator(nn.Module):
 
     def _gate(self, gate_raw: Tensor):
         if self.gate_tanh_scale > 0.:
-            gate = 1 + self.gate_tanh_scale * torch.tanh(gate_raw)
+            gate = 1.0 + self.gate_tanh_scale * F.tanh(gate_raw)
         else:
-            gate = 1 + gate_raw
+            gate = 1.0 + gate_raw
         return gate # (B, 1)
 
     def _split(self, mod: Tensor) -> Tuple[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
