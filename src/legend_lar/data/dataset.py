@@ -219,7 +219,7 @@ class LArListDataset(IterableDataset):
                 dataset.data.close()
         except Exception:
             pass
-    
+
     def __iter__(self):
         try:
             assert self.datasets is not None
@@ -229,19 +229,19 @@ class LArListDataset(IterableDataset):
                 labels = []
                 indices = None
                 break_ = False
-                for dataset in self.datasets:
+                for i, dataset in enumerate(self.datasets):
                     partial_batch, label, indices_shard = dataset[idx]
                     batch.append(partial_batch.toarray().reshape(-1, self.num_t_bins, self.num_sipm_chs))
                     labels.append(label)
-                    if label[0] == self.true_coincidence_label:
+                    if label[i] == self.true_coincidence_label:
                         indices = indices_shard
                     if partial_batch is None:
                         break_ = True
                 if break_:
                     break
 
-                batch = np.concatenate(batch, axis=0)
-                labels = np.concatenate(labels, axis=0)
+                batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+                labels = np.concatenate(labels, axis=0) if len(labels) > 0 else labels[0]
                 indices = np.array(indices, dtype=np.int64)
                 yield batch, self.hpge_dataset[indices], labels
         except Exception as e:

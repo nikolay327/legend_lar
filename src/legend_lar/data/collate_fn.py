@@ -1,5 +1,6 @@
 from typing import Tuple
 import torch
+from torch import Tensor
 from legend_lar.utils import pack_data
 
 class CollateFn:
@@ -22,19 +23,19 @@ class CollateFn:
             self._device_set = True
 
     @torch.no_grad()
-    def preprocess(self, batch: Tuple):
-        x, gE, labels = batch
+    def preprocess(self, x: Tensor, gE: Tensor, labels: Tensor):
         x = torch.from_numpy(x).to(dtype=torch.float32)
         gE = torch.from_numpy(gE).to(dtype=torch.float32)
         labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
-        gE_random_pairs = gE.new_zeros((len(x), 2))
-        num_tc = int((labels == self.true_coincidence_label).sum().detach().item())
-        gE_random_pairs[num_tc:] = gE
-        gE_random_pairs[:num_tc] = gE
-
-        g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_data(x, gE_random_pairs, zero_token_id=self.num_sipm_chs)
-
+        if len(gE) != len(x): # For the unconditional branch and BCE branch
+            gE_random_pairs = gE.new_zeros((len(x), 2))
+            num_tc = int((labels == self.true_coincidence_label).sum().detach().item())
+            gE_random_pairs[num_tc:] = gE
+            gE_random_pairs[:num_tc] = gE
+            g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_data(x, gE_random_pairs, zero_token_id=self.num_sipm_chs)
+        else: # For the conditional branch
+            g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.num_sipm_chs)
         return g.to(dtype=torch.float32), E.to(dtype=torch.float32), b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32), cu_seqlens.to(dtype=torch.float32), int(max_seqlen), lengths.to(dtype=torch.float32), labels
 
     def __call__(self, batch: Tuple):

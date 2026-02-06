@@ -3,8 +3,6 @@ from pathlib import Path
 import shutil
 from typing import Tuple
 
-import numpy as np
-
 import torch
 import torch._inductor.config as cfg
 cfg.autotune_local_cache = False
@@ -16,7 +14,7 @@ import torch.multiprocessing as mp
 from torch.amp import autocast
 from bitsandbytes.optim import LAMB
 
-from legend_lar.model import NRatioEstimator
+from legend_lar.model import UnconditionalRatioEstimator
 from legend_lar.utils import NRETestMetrics, ModelConfig, Paths, load_config, init_config
 from legend_lar.data import LArListDataset, CollateFn, worker_init_fn
 
@@ -24,7 +22,7 @@ from legend_lar.data import LArListDataset, CollateFn, worker_init_fn
 class Trainer:
     def __init__(
         self,
-        model: NRatioEstimator,
+        model: UnconditionalRatioEstimator,
         config: ModelConfig,
         dataloader: DataLoader,
         val_dataloader: DataLoader,
@@ -86,7 +84,7 @@ class Trainer:
             "train_acc": self.train_acc,
             "calibration_metrics": nre_test_result
         }, f'{self.config.save_to}/checkpoint_{epoch}.pt')
-        print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")       
+        print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")
 
     def init_optimizer(self, model_opt_state):
         self.model_opt = LAMB(
@@ -101,8 +99,6 @@ class Trainer:
 
     def train_batch(
         self,
-        g: Tensor,
-        E: Tensor,
         b_idx: Tensor,
         t_idx: Tensor,
         s_idx: Tensor,
@@ -113,8 +109,6 @@ class Trainer:
     ):
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = self.model(
-                g=g,
-                E=E,
                 b_idx=b_idx,
                 t_idx=t_idx,
                 s_idx=s_idx,
@@ -143,9 +137,9 @@ class Trainer:
         n_step = 0
 
         for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.dataloader:
+            g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
+            E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
             loss_, acc_ = self.train_batch(
-                g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
@@ -165,8 +159,6 @@ class Trainer:
     @torch.no_grad()
     def val_batch(
         self,
-        g: Tensor,
-        E: Tensor,
         b_idx: Tensor,
         t_idx: Tensor,
         s_idx: Tensor,
@@ -177,8 +169,6 @@ class Trainer:
     ):
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = self.model(
-                g=g,
-                E=E,
                 b_idx=b_idx,
                 t_idx=t_idx,
                 s_idx=s_idx,
@@ -199,9 +189,9 @@ class Trainer:
         loss = 0.
         n_step = 0
         for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.val_dataloader:
+            g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
             loss_, logits, label = self.val_batch(
-                g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
@@ -293,14 +283,14 @@ def _initialize_configs(
     return config, data_config, paths
 
 def _prepare_model(model_config: ModelConfig, device: str | int):
-    model = NRatioEstimator(
+    model = UnconditionalRatioEstimator(
         config=model_config,
         device=device
     ).to(dtype=torch.float32)
 
     return model
 
-def train(starting_epoch: int, final_epoch: int, experiment: str, model_name: str, version: str, working_dir: str, data_dir: str, training_config: str):
+def train_unconditional(starting_epoch: int, final_epoch: int, experiment: str, model_name: str, version: str, working_dir: str, data_dir: str, training_config: str):
     local_rank, rank, world_size, device = _init_torch()
     wd = Path(working_dir)
     mmpd = Path(data_dir)
@@ -437,4 +427,4 @@ if __name__ == "__main__":
 
     JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
 
-    train(args.starting_epoch, args.final_epoch, args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)
+    train_unconditional(args.starting_epoch, args.final_epoch, args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)

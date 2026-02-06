@@ -24,6 +24,8 @@ class ModelConfig:
     num_layers: int = None
     causal: int = None
 
+    rng_seed_for_negative_shuffling: float = None
+    temperature: float = None
     hpge_energy_mean: float = None
     hpge_energy_std: float = None
 
