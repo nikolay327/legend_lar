@@ -321,7 +321,7 @@ def _prepare_model(model_config: ModelConfig, device: str | int):
 
     return model
 
-def train_bce(starting_epoch: int, final_epoch: int, experiment: str, model_name: str, version: str, working_dir: str, data_dir: str, training_config: str):
+def train_conditional(starting_epoch: int, final_epoch: int, experiment: str, model_name: str, version: str, working_dir: str, data_dir: str, training_config: str):
     local_rank, rank, world_size, device = _init_torch()
     wd = Path(working_dir)
     mmpd = Path(data_dir)
@@ -458,4 +458,4 @@ if __name__ == "__main__":
 
     JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
 
-    train_bce(args.starting_epoch, args.final_epoch, args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)
+    train_conditional(args.starting_epoch, args.final_epoch, args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)
