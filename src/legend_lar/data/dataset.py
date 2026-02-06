@@ -88,7 +88,6 @@ class LArListDataset(IterableDataset):
         super(LArListDataset, self).__init__()
         assert len(lar_paths) == len(prior)
         assert sum(prior) == 1.0
-        assert prior[0] == prior[1] == 0.5, "Only supports 50:50 prior for now"
 
         self.train_val_test_fract = train_val_test_fract
         self.rng_seed_for_split = rng_seed_for_split
@@ -179,7 +178,7 @@ class LArListDataset(IterableDataset):
     def _read_hpge_dataset(self):
         """To be called inside each worker since the hpge data is only < 1MB"""
         self.hpge_dataset = open_memmap(self.hpge_path, mode="r").copy()
-        self.hpge_dataset = (self.hpge_dataset - self.hpge_energy_mean) / self.hpge_energy_std
+        self.hpge_dataset[:, 1] = (self.hpge_dataset[:, 1] - self.hpge_energy_mean) / self.hpge_energy_std
 
     def __len__(self):
         if self.datasets is None:

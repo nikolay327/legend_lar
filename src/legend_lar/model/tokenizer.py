@@ -26,7 +26,7 @@ class ContinuousEmbedder(nn.Module):
         return self.emb(x)
 
 class JointHPGeEmbedder(nn.Module):
-    def __int__(
+    def __init__(
         self,
         emb_dim: int,
         hpge_codebook_size: int,

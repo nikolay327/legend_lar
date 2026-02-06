@@ -253,7 +253,3 @@ class ConditionalRatioEstimator(nn.Module):
         neg_logits = (anchors @ e_hpge[shuffler].t()) / self.config.temperature # (B, B)
         logits = torch.cat([pos_logits, neg_logits], dim=-1) # (B, B + 1)
         return logits
-
-    def tokenize_then_forward(self, x: Tensor, gE: Tensor):
-        g, E, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)
-        return self.forward(g.to(torch.long), E.to(torch.float32), b_all.to(torch.long), t_all.to(torch.long), k_all.to(torch.long), cu_seqlens.to(torch.int32), max_seqlen, lengths.to(torch.long))

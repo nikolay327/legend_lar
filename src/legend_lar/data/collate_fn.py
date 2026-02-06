@@ -34,14 +34,15 @@ class CollateFn:
             gE_random_pairs[num_tc:] = gE
             gE_random_pairs[:num_tc] = gE
             g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_data(x, gE_random_pairs, zero_token_id=self.num_sipm_chs)
+            return g.to(dtype=torch.float32), E.to(dtype=torch.float32), b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32), cu_seqlens.to(dtype=torch.float32), int(max_seqlen), lengths.to(dtype=torch.float32), labels
         else: # For the conditional branch
             g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.num_sipm_chs)
-        return g.to(dtype=torch.float32), E.to(dtype=torch.float32), b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32), cu_seqlens.to(dtype=torch.float32), int(max_seqlen), lengths.to(dtype=torch.float32), labels
+            return gE[:, 0].to(dtype=torch.float32), gE[:, 1].to(dtype=torch.float32), b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32), cu_seqlens.to(dtype=torch.float32), int(max_seqlen), lengths.to(dtype=torch.float32), labels
 
     def __call__(self, batch: Tuple):
         self._set_worker_cuda()
 
-        g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels = self.preprocess(batch)
+        g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels = self.preprocess(*batch)
         g = g.pin_memory()
         E = E.pin_memory()
         b_idx = b_idx.pin_memory()

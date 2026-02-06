@@ -32,7 +32,7 @@ class Trainer:
         self.device = device
         self.config = config
 
-        self.rng_for_negative_shuffling = torch.Generator(device=self.device)
+        self.rng_for_negative_shuffling = torch.Generator(device="cpu")
         self.dataloader = dataloader
         self.val_dataloader = val_dataloader
 
@@ -64,7 +64,7 @@ class Trainer:
             cp = torch.load(f'{self.config.save_to}/checkpoint_{checkpoint_id}.pt', map_location=self.device)
             self.model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
 
-        self.model = torch.compile(self.model, dynamic=True)
+        self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
 
         if checkpoint_id == 0:
             return None
@@ -112,7 +112,7 @@ class Trainer:
         max_seqlen: int,
         lengths: Tensor
     ):
-        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long, device=self.device)
+        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long).to(device=self.device)
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = self.model.training_forward(
                 g=g,
@@ -151,7 +151,8 @@ class Trainer:
         loss = 0.
         n_step = 0
 
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, _ in self.dataloader:
+        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.dataloader:
+            labels=labels.to(device=self.device, non_blocking=True)
             loss_, acc_ = self.train_batch(
                 g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
@@ -180,10 +181,9 @@ class Trainer:
         s_idx: Tensor,
         cu_seqlens: Tensor,
         max_seqlen: int,
-        lengths: Tensor,
-        labels: Tensor
+        lengths: Tensor
     ):
-        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long, device=self.device)
+        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long).to(device=self.device)
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = self.model.training_forward(
                 g=g,
@@ -220,7 +220,8 @@ class Trainer:
 
         loss = 0.
         n_step = 0
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, _ in self.val_dataloader:
+        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.val_dataloader:
+            labels=labels.to(device=self.device, non_blocking=True)
             loss_, logits, label = self.val_batch(
                 g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
@@ -249,6 +250,7 @@ class Trainer:
         self.init_optimizer(model_opt_state)
 
         for epoch in range(starting_epoch, final_epoch+1):
+            self._set_epoch(epoch)
             self.model.train()
             self.train_epoch(epoch)
 
