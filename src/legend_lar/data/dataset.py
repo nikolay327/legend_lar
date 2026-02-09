@@ -290,8 +290,8 @@ class LArListDataset(IterableDataset):
 
                 batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
                 labels = np.concatenate(labels, axis=0) if len(labels) > 0 else labels[0]
-                indices = np.array(indices, dtype=np.int64)
-                yield batch, self.hpge_dataset[indices], labels
+                indices = np.array(indices, dtype=np.int64) if indices is not None else None
+                yield batch, self.hpge_dataset[indices] if indices is not None else np.zeros((len(batch), 2), dtype=np.float32), labels # the indices == None case is for LAr FT data loading without physics data
         except Exception as e:
             self._close_worker_resources()
             traceback.print_exc()

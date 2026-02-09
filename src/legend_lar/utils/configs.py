@@ -116,3 +116,16 @@ def _initialize_configs(
     )
 
     return config, data_config, paths
+
+@dataclass
+class EvalConfig:
+    unconditional_cp_id: int = None
+    conditional_cp_id: int = None
+
+    local_batch_size: int = None
+    calib_dataset_frac: float = None
+
+    num_zero_pe_in_lar_ft: int = None
+    num_high_pe_in_lar_ft: int = None
+
+    alpha: float = None

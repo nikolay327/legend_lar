@@ -1,4 +1,3 @@
-from numpy import float32
 import torch
 import torch.nn as nn
 from torch import Tensor

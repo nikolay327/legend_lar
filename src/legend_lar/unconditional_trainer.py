@@ -295,6 +295,7 @@ def train_unconditional(starting_epoch: int, final_epoch: int, experiment: str, 
         collate_fn=collate_fn
     )
 
+    epoch_value_val = mp.Value("i", starting_epoch)
     val_dataset = LArListDataset(
         hpge_path=config.hpge_id_and_energy,
         lar_paths=config.data_paths,
@@ -310,7 +311,7 @@ def train_unconditional(starting_epoch: int, final_epoch: int, experiment: str, 
         rng_seed_for_split=config.rng_seed_for_split,
         times_of_mixing=config.times_of_mixing,
         global_rng_seed_for_sampling=config.global_rng_seed_for_sampling,
-        epoch_value=epoch_value
+        epoch_value=epoch_value_val
     )
     val_dataset.set_mode(1)
     val_dataloader = DataLoader(

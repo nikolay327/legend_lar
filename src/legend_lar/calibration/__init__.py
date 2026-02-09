@@ -1,5 +1,6 @@
-from .ece import NRETestMetrics
+from .ece import NRETestMetrics, evaluate
 
 __all__ = [
-    "NRETestMetrics"
+    "NRETestMetrics",
+    "evaluate"
 ]
