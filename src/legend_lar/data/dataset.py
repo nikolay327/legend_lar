@@ -15,13 +15,17 @@ class LArDataset:
         label: int,
         shuffled_indices: np.ndarray | list[int],
         train_val_test_cumsum: np.ndarray | list[int],
-        batch_size: int
+        batch_size: int,
+        calib_mode: bool = None,
+        calib_dataset_frac: float = None
     ):
         self.lar_path = lar_path
         self.label = label
         self.shuffled_indices = shuffled_indices
         self.train_val_test_cumsum = train_val_test_cumsum
         self.batch_size = batch_size
+        self.calib_mode = calib_mode
+        self.calib_dataset_frac = calib_dataset_frac
 
         self.mode_idx = None # train (0), val (1), or test (2)
         self.indices_buffer = None
@@ -35,15 +39,47 @@ class LArDataset:
 
     def set_mode(self, mode_idx: int):
         """To be called before DataLoader is intilialized."""
-        assert mode_idx in (0, 1, 2)
-        self.indices_buffer = np.arange(self.train_val_test_cumsum[mode_idx], self.train_val_test_cumsum[mode_idx+1])
+        self.mode_idx = mode_idx
+
+        if mode_idx in (0, 1, 2):
+            self.indices_buffer = np.arange(self.train_val_test_cumsum[mode_idx], self.train_val_test_cumsum[mode_idx+1])
+        else:
+            self.indices_buffer = np.arange(self.train_val_test_cumsum[0], self.train_val_test_cumsum[-1])
+
+        if mode_idx != 2:
+            assert self.calib_mode is None
+        else:
+            assert self.calib_mode is not None
+
+            calib_data_size = int(self.calib_dataset_frac * len(self.indices_buffer))
+            if self.calib_mode:
+                self.indices_buffer = self.indices_buffer[calib_data_size:]
+            else:
+                self.indices_buffer = self.indices_buffer[:calib_data_size]
 
     def shuffle(self, shuffler: np.ndarray):
         """To be called by each worker, using a global rng seed."""
-        assert len(self.indices_buffer) == len(shuffler)
-        self.indices = np.array(self.indices_buffer, dtype=np.int64)[shuffler]
+        if shuffler is None:
+            if self.mode_idx in (0, 1, 2):
+                self.indices = self.shuffled_indices[self.indices_buffer.astype(np.int64)].astype(np.float32)
+            else:
+                self.indices = self.indices_buffer.astype(np.float32)
+        else:
+            assert len(self.indices_buffer) == len(shuffler)
+            self.indices = self.shuffled_indices[self.indices_buffer.astype(np.int64)][shuffler].astype(np.float32)
 
-        self.indices = self.indices[:self.batch_size * (len(self.indices) // self.batch_size)]  # drop the last incomplete batch
+        last_batch = None
+        if self.mode_idx not in (0, 1) : # no drop-last during test and calibration mode, and an unshuffled mode
+            if len(self.indices) % self.batch_size != 0:
+                last_batch_len = len(self.indices) - self.batch_size * (len(self.indices) // self.batch_size)
+                # pad the last incomplete batch with nans and append to self.indices
+                last_batch = np.zeros(self.batch_size)
+                last_batch[:last_batch_len] = self.indices[-last_batch_len:]
+                last_batch[last_batch_len:] = np.nan
+
+        self.indices = self.indices[:self.batch_size * (len(self.indices) // self.batch_size)] # drop the last incomplete batch
+        if last_batch is not None:
+            self.indices = np.concatenate((self.indices, last_batch), axis=0)
         self.indices = self.indices.reshape(-1, self.batch_size)
         self.indices = self.indices[self.worker_id::self.num_workers]
 
@@ -64,6 +100,7 @@ class LArDataset:
 
     def __getitem__(self, idx: int):
         ids = self.indices[idx]
+        ids = ids[~np.isnan(ids)].astype(np.int64)
         return self.data[ids.tolist()], np.ones(self.batch_size, dtype=np.float32) * self.label, ids
 
 class LArListDataset(IterableDataset):
@@ -83,7 +120,10 @@ class LArListDataset(IterableDataset):
         rng_seed_for_split: int,
         times_of_mixing: int,
         global_rng_seed_for_sampling: int,
-        epoch_value: mp.Value = None
+        epoch_value: mp.Value = None,
+        shuffle: bool = True,
+        calib_mode: bool = None,
+        calib_dataset_frac: float = None
     ):
         super(LArListDataset, self).__init__()
         assert len(lar_paths) == len(prior)
@@ -106,12 +146,16 @@ class LArListDataset(IterableDataset):
         self.num_sipm_chs = num_sipm_chs
         self.global_rng_seed_for_sampling = global_rng_seed_for_sampling
         self.epoch_value = epoch_value
+        self.shuffle = shuffle
 
         self.stratified_batch_sizes = None
         self.mixed_indices = None
         self.train_val_test_nums = None
         self.train_val_test_cumsums = None
         self.mode = None  # train (0), val (1), or test (2)
+
+        self.calib_mode = calib_mode
+        self.calib_dataset_frac = calib_dataset_frac
 
         self._set_stratified_batch_sizes()
         self._set_mixed_indices()
@@ -137,10 +181,12 @@ class LArListDataset(IterableDataset):
                 label=self.labels[i],
                 shuffled_indices=self.mixed_indices[i],
                 train_val_test_cumsum=self.train_val_test_cumsums[i],
-                batch_size=self.stratified_batch_sizes[i]
+                batch_size=self.stratified_batch_sizes[i],
+                calib_mode=self.calib_mode,
+                calib_dataset_frac=self.calib_dataset_frac
             )
             self.datasets.append(lar_dataset)
-    
+
     def _set_mixed_indices(self):
         # Monotonicly increasing default indices
         self.data_lengths = [
@@ -156,14 +202,14 @@ class LArListDataset(IterableDataset):
                 permuted_idx = permuted_idx[rng.permutation(len(permuted_idx))]
             mixed_indices[i] = permuted_idx.tolist()
         self.mixed_indices = mixed_indices
-    
+
     def _set_train_val_test_nums(self):
         self.train_val_test_nums = []
         for i in range(len(self.data_lengths)):
             train = int(math.ceil(self.data_lengths[i] * self.train_val_test_fract[0]))
             test = int(math.ceil(self.data_lengths[i] * self.train_val_test_fract[-1]))
             val = int(self.data_lengths[i] - train - test)
-            assert val > self.stratified_batch_sizes[i] # validation dataset cannot be smaller than the stratified batch size
+            assert val > self.stratified_batch_sizes[i] if val != 0 else True # validation dataset cannot be smaller than the stratified batch size. val = 0 means we are evaluating the entire dataset
 
             self.train_val_test_nums.append([train, val, test])
 
@@ -209,7 +255,10 @@ class LArListDataset(IterableDataset):
         """To be called by each worker inside __iter__(), using a global rng seed."""
         rng = np.random.default_rng(self.global_rng_seed_for_sampling + self.epoch_value.value)
         for dataset in self.datasets:
-            shuffler = rng.permutation(len(dataset.indices_buffer))
+            if self.shuffle:
+                shuffler = rng.permutation(len(dataset.indices_buffer))
+            else:
+                shuffler = None
             dataset.shuffle(shuffler)
 
     def _close_worker_resources(self):

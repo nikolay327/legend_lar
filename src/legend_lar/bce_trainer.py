@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-import shutil
-from typing import Tuple
 
 import torch
 import torch._inductor.config as cfg

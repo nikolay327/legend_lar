@@ -21,7 +21,7 @@ from legend_lar.calibration import NRETestMetrics
 class Trainer:
     def __init__(
         self,
-        model: ConditionalRatioEstimator ,
+        model: ConditionalRatioEstimator,
         config: ModelConfig,
         dataloader: DataLoader,
         val_dataloader: DataLoader,
@@ -39,7 +39,7 @@ class Trainer:
 
         self._init_loss_store()
         self.nre_tester = nre_tester
-    
+
     def _set_epoch(self, epoch: int):
         self.rng_for_negative_shuffling.manual_seed(self.config.rng_seed_for_negative_shuffling + epoch)
 
@@ -194,7 +194,6 @@ class Trainer:
                 max_seqlen=max_seqlen,
                 lengths=lengths,
                 shuffler=shuffler
-
             )
         logits = logits.to(dtype=torch.float32)
         labels = torch.zeros(

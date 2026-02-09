@@ -82,7 +82,8 @@ class BCERatioEstimator(nn.Module):
         x = self.norm(residual + g2_ * x) # (N, D)
 
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
-        pooled = x.new_zeros((self.config.local_batch_size, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
+        B = b_idx.max().detach().cpu().item() + 1
+        pooled = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
         pooled.index_add_(0, b_idx, x) # For each i, x[i] is added into pooled[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
@@ -148,7 +149,8 @@ class UnconditionalRatioEstimator(nn.Module):
         x = self.norm(residual + x) # (N, D)
 
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
-        pooled = x.new_zeros((self.config.local_batch_size, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
+        B = b_idx.max().detach().cpu().item() + 1
+        pooled = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
         pooled.index_add_(0, b_idx, x) # For each i, x[i] is added into pooled[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
@@ -199,9 +201,11 @@ class ConditionalRatioEstimator(nn.Module):
         s_idx: Tensor, # (N,)
         cu_seqlens: Tensor, # (N+1,)
         max_seqlen: int,
-        lengths: Tensor # (N,)
+        lengths: Tensor, # (N,)
+        e_hpge_: Tensor = None # (B, D)
     ) -> Tensor:
-        e_hpge = self.joint_hpge_emb(g, E) # (B, D)
+        if e_hpge_ is None:
+            e_hpge = self.joint_hpge_emb(g, E) # (B, D)
 
         x = self.sipm_emb(s_idx) # (N, D)
         x = self.time_emb(x, t_idx)
@@ -216,14 +220,15 @@ class ConditionalRatioEstimator(nn.Module):
         x = self.norm(residual + x) # (N, D)
 
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
-        anchors = x.new_zeros((self.config.local_batch_size, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
+        B = b_idx.max().detach().cpu().item() + 1
+        anchors = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
         anchors.index_add_(0, b_idx, x) # For each i, x[i] is added into anchors[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1) # (B,1) the total number of pe in a batch entry
         anchors = anchors / num_pe # (B, D)
 
         # Contrastive loss
         anchors = F.normalize(anchors, p=2, dim=-1)
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1)
+        e_hpge = F.normalize(e_hpge, p=2, dim=-1) if e_hpge_ is None else e_hpge_
         pos_logits = (anchors * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B, 1)
 
         return pos_logits, (anchors, e_hpge)
