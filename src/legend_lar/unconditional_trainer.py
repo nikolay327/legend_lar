@@ -15,8 +15,9 @@ from torch.amp import autocast
 from bitsandbytes.optim import LAMB
 
 from legend_lar.model import UnconditionalRatioEstimator
-from legend_lar.utils import NRETestMetrics, ModelConfig, Paths, load_config, init_config
+from legend_lar.utils import ModelConfig, Paths, load_config, init_config
 from legend_lar.data import LArListDataset, CollateFn, worker_init_fn
+from legend_lar.calibration import NRETestMetrics
 
 
 class Trainer:
