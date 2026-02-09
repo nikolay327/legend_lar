@@ -1,3 +1,6 @@
+import os
+import shutil
+from typing import Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,3 +88,31 @@ def init_config(paths: Paths, experiment: str, model_name: str, version: str, mo
 
     config.save_to = str(paths.trained / experiment / model_name / version / "checkpoints")
     return config
+
+def _initialize_configs(
+    config_obj: ModelConfig,
+    wd: Path,
+    experiment: str,
+    model_name: str,
+    version: str,
+    mmpd: Path,
+    training_config: str = None
+) -> Tuple[ModelConfig, dict, Paths]:
+    config_json = wd / "trained" / experiment / model_name / version / f"{model_name}_{version}.json"
+    os.makedirs(os.path.dirname(str(config_json)), exist_ok=True)
+    if training_config is not None and not config_json.exists():
+        shutil.copy(training_config, config_json)
+
+    model_config, data_config, paths = load_config(config_json, wd, mmpd)
+    paths.make_checkpoint_dir(experiment, model_name, version)
+
+    config = init_config(
+        paths=paths,
+        experiment=experiment,
+        model_name=model_name,
+        version=version,
+        model_config=model_config,
+        config_obj=config_obj
+    )
+
+    return config, data_config, paths

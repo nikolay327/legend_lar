@@ -15,7 +15,7 @@ from torch.amp import autocast
 from bitsandbytes.optim import LAMB
 
 from legend_lar.model import BCERatioEstimator
-from legend_lar.utils import ModelConfig, Paths, load_config, init_config
+from legend_lar.utils import ModelConfig, _initialize_configs, _init_torch
 from legend_lar.data import LArListDataset, CollateFn, worker_init_fn
 from legend_lar.calibration import NRETestMetrics
 
@@ -234,62 +234,6 @@ class Trainer:
             nre_test_result = self.val_epoch(epoch, final_epoch - starting_epoch + 1)
 
             self.save_checkpoint(epoch, nre_test_result)
-
-def _init_torch():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.enable_math_sdp(False)
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
-
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-    else:
-        rank = 0
-        world_size = 1
-    
-    if "LOCAL_RANK" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-    else:
-        local_rank = 0
-
-    if mp.get_start_method(allow_none=True) != "spawn":
-        mp.set_start_method("spawn", force=True)
-    device = torch.device(f"cuda:{local_rank}")
-
-    torch.cuda.set_device(device)
-
-    return local_rank, rank, world_size, device
-
-def _initialize_configs(
-    config_obj: ModelConfig,
-    wd: Path,
-    experiment: str,
-    model_name: str,
-    version: str,
-    mmpd: Path,
-    training_config: str = None
-) -> Tuple[ModelConfig, dict, Paths]:
-    config_json = wd / "trained" / experiment / model_name / version / f"{model_name}_{version}.json"
-    os.makedirs(os.path.dirname(str(config_json)), exist_ok=True)
-    if training_config is not None and not config_json.exists():
-        shutil.copy(training_config, config_json)
-
-    model_config, data_config, paths = load_config(config_json, wd, mmpd)
-    paths.make_checkpoint_dir(experiment, model_name, version)
-
-    config = init_config(
-        paths=paths,
-        experiment=experiment,
-        model_name=model_name,
-        version=version,
-        model_config=model_config,
-        config_obj=config_obj
-    )
-
-    return config, data_config, paths
 
 def _prepare_model(model_config: ModelConfig, device: str | int):
     model = BCERatioEstimator(
