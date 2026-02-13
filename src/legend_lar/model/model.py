@@ -228,9 +228,9 @@ class ConditionalRatioEstimator(nn.Module):
         # Contrastive loss
         anchors = F.normalize(anchors, p=2, dim=-1)
         e_hpge = F.normalize(e_hpge, p=2, dim=-1) if e_hpge_ is None else e_hpge_
-        pos_logits = (anchors * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B, 1)
+        logits = (anchors * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B, 1)
 
-        return pos_logits, (anchors, e_hpge)
+        return logits, (anchors, e_hpge)
 
     def training_forward(
         self,
@@ -241,10 +241,9 @@ class ConditionalRatioEstimator(nn.Module):
         s_idx: Tensor, # (N,)
         cu_seqlens: Tensor, # (N+1,)
         max_seqlen: int,
-        lengths: Tensor, # (N,)
-        shuffler: Tensor # (B,)
+        lengths: Tensor # (N,)
     ):
-        pos_logits, (anchors, e_hpge) = self.forward(
+        _, (anchors, e_hpge) = self.forward(
             g=g,
             E=E,
             b_idx=b_idx,
@@ -254,6 +253,6 @@ class ConditionalRatioEstimator(nn.Module):
             max_seqlen=max_seqlen,
             lengths=lengths
         )
-        neg_logits = (anchors @ e_hpge[shuffler].t()) / self.config.temperature # (B, B)
-        logits = torch.cat([pos_logits, neg_logits], dim=-1) # (B, B + 1)
-        return logits
+        logits = (anchors @ e_hpge.t()) / self.config.temperature # (B, B)
+        labels = torch.arange(logits.size(0), device=logits.device) # (B,)
+        return logits, labels

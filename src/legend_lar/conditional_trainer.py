@@ -31,7 +31,6 @@ class Trainer:
         self.device = device
         self.config = config
 
-        self.rng_for_negative_shuffling = torch.Generator(device="cpu")
         self.dataloader = dataloader
         self.val_dataloader = val_dataloader
 
@@ -39,9 +38,6 @@ class Trainer:
 
         self._init_loss_store()
         self.nre_tester = nre_tester
-
-    def _set_epoch(self, epoch: int):
-        self.rng_for_negative_shuffling.manual_seed(self.config.rng_seed_for_negative_shuffling + epoch)
 
     def _init_loss_store(self):
         self.train_loss = []
@@ -111,9 +107,8 @@ class Trainer:
         max_seqlen: int,
         lengths: Tensor
     ):
-        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long).to(device=self.device)
         with autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = self.model.training_forward(
+            logits, labels = self.model.training_forward(
                 g=g,
                 E=E,
                 b_idx=b_idx,
@@ -121,16 +116,10 @@ class Trainer:
                 s_idx=s_idx,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                lengths=lengths,
-                shuffler=shuffler
+                lengths=lengths
             )
         logits = logits.to(dtype=torch.float32)
-        # Label: 0 == index of the positive in each row
-        labels = torch.zeros(
-            logits.size(0),
-            dtype=torch.long,
-            device=logits.device
-        )
+        labels = labels.to(dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels, reduction="mean")
 
         self.model_opt.zero_grad()
@@ -138,9 +127,9 @@ class Trainer:
         self.model_opt.step()
 
         with torch.no_grad():
-            acc = (F.sigmoid(logits[:, 0]) > 0.5).to(torch.float32).sum()
-            acc += (F.sigmoid(logits[:, 1]) <= 0.5).to(torch.float32).sum() # only take the first slice of the negative samples
-            acc = acc / labels.shape[0]
+            acc = (F.sigmoid(logits.diagonal()) > 0.5).to(torch.float32).sum()
+            acc += (F.sigmoid(logits[torch.eye(logits.size(0), dtype=torch.float32, device=logits.device) == 0]) <= 0.5).to(torch.float32).sum() / (logits.size(0) - 1)
+            acc = acc / (2 * labels.shape[0])
 
         return loss.detach().cpu().item(), acc.detach().cpu().item()
 
@@ -182,9 +171,8 @@ class Trainer:
         max_seqlen: int,
         lengths: Tensor
     ):
-        shuffler = torch.randperm(len(E), generator=self.rng_for_negative_shuffling, dtype=torch.long).to(device=self.device)
         with autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = self.model.training_forward(
+            logits, labels = self.model.training_forward(
                 g=g,
                 E=E,
                 b_idx=b_idx,
@@ -192,24 +180,17 @@ class Trainer:
                 s_idx=s_idx,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                lengths=lengths,
-                shuffler=shuffler
+                lengths=lengths
             )
         logits = logits.to(dtype=torch.float32)
-        labels = torch.zeros(
-            logits.size(0),
-            dtype=torch.long,
-            device=logits.device
-        )
+        labels = labels.to(dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels, reduction="mean")
 
-        logits = logits.detach()
-        logits = torch.cat((logits[:, 0], logits[:, 1]), dim=0)
-
+        logits = torch.cat((logits.diagonal()[1:], logits[1:, 0]), dim=0)
         labels = torch.zeros_like(logits)
-        labels[:len(E)] = 1.0
+        labels[:len(logits) // 2] = 1.0
 
-        return loss.detach().cpu().item(), logits.detach(), labels.detach()
+        return loss.cpu().item(), logits, labels
     
     def val_epoch(self, epoch: int, global_rng_seed_offset: int):
         self.val_dataloader.dataset.set_epoch(global_rng_seed_offset + epoch)
@@ -248,7 +229,6 @@ class Trainer:
         self.init_optimizer(model_opt_state)
 
         for epoch in range(starting_epoch, final_epoch+1):
-            self._set_epoch(epoch)
             self.model.train()
             self.train_epoch(epoch)
 

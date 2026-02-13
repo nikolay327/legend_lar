@@ -55,14 +55,14 @@ class Evaluator:
 
     def load_checkpoint(self):
         assert self.eval_config.conditional_cp_id > 0
-        cp = torch.load(f'{self.config.save_to}/checkpoint_{self.eval_config.conditional_cp_id}.pt', map_location=self.device)
+        cp = torch.load(f'{self.conditional_config.save_to}/checkpoint_{self.eval_config.conditional_cp_id}.pt', map_location=self.device)
         self.conditional_model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
-        self.conditional_model = torch.compile(self.conditional_model, mode="reduce-overhead", dynamic=True)
+        self.conditional_model = torch.compile(self.conditional_model, dynamic=True)
 
         assert self.eval_config.unconditional_cp_id > 0
-        cp = torch.load(f'{self.config.save_to}/checkpoint_{self.eval_config.unconditional_cp_id}.pt', map_location=self.device)
-        self.uconditional_model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
-        self.uconditional_model = torch.compile(self.uconditional_model, mode="reduce-overhead", dynamic=True)
+        cp = torch.load(f'{self.unconditional_config.save_to}/checkpoint_{self.eval_config.unconditional_cp_id}.pt', map_location=self.device)
+        self.unconditional_model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
+        self.unconditional_model = torch.compile(self.unconditional_model, dynamic=True)
 
     def batch_forward(
         self,
@@ -119,7 +119,7 @@ class Evaluator:
         self.rc_unconditional_logit_buffer = torch.cat(self.rc_unconditional_logit_buffer, dim=0) # (B_rc,)
 
         lgdo_table = Table(
-            size=1,
+            size=len(self.rc_unconditional_logit_buffer),
             col_dict={
                 "null_unconditional_logits": Array(self.rc_unconditional_logit_buffer.cpu().numpy(), dtype=np.float32)
             }
@@ -128,14 +128,14 @@ class Evaluator:
             lgdo_table,
             "null/evt", # NOTE: for now hardcoded
             self.save_to,
-            n_rows=1,
+            n_rows=len(self.rc_unconditional_logit_buffer),
             wo_mode="append"
         )
 
     @torch.no_grad()
     def evaluate_phys(self):
         self.phy_dataloader.dataset.set_epoch(1)
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, _ in self.lar_dataloader:
+        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, _ in self.phy_dataloader:
             unconditional_logit, conditional_logit, _, e_hpge = self.batch_forward(
                 g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
@@ -164,14 +164,21 @@ class Evaluator:
             q = ((1 - self.eval_config.alpha) * N_tot - self.eval_config.num_zero_pe_in_lar_ft) / N_rc_data
             q = float(max(0.0, min(1.0, q)))
 
-            cut = torch.quantile(null_conditional_logits + self.rc_unconditional_logit_buffer.reshape(1, -1), q, dim=-1) # (B,)
-            is_accepted = ((unconditional_logit + conditional_logit) <= cut).to(torch.float32)
+            null_logits = null_conditional_logits + self.rc_unconditional_logit_buffer.reshape(1, -1) # (B, N_rc_data)
+            logits = unconditional_logit + conditional_logit # (B,)
+
+            cut = torch.quantile(null_logits, q, dim=-1) # (B,)
+            is_accepted = (logits <= cut).to(torch.float32)
+
+            # calibrated p-values
+            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + self.eval_config.num_high_pe_in_lar_ft + 1) / (N_rc_data + self.eval_config.num_zero_pe_in_lar_ft + 1) # (B,)
 
             unconditional_logit = unconditional_logit.cpu().numpy() # (B,)
             conditional_logit = conditional_logit.cpu().numpy() # (B,)
-            null_conditional_logits = null_conditional_logits.cpu().numpy() # (B,)
+            null_conditional_logits = null_conditional_logits.cpu().numpy() # (B, N_rc_data)
             cut = cut.cpu().numpy() # (B,)
             is_accepted = is_accepted.cpu().numpy() # (B,)
+            p_val = p_val.cpu().numpy() # (B,)
 
             g_id = g.to(torch.float32).cpu().numpy() # (B,)
             energy = E.to(torch.float32).cpu().numpy() # (B,)
@@ -188,7 +195,8 @@ class Evaluator:
 
                     "null_conditional_logits": Array(null_conditional_logits, dtype=np.float32),
                     "cut": Array(cut, dtype=np.float32),
-                    "is_accepted": Array(is_accepted, dtype=np.float32)
+                    "is_accepted": Array(is_accepted, dtype=np.float32),
+                    "p_val": Array(p_val, dtype=np.float32)
                 }
             )
             lh5.write(
@@ -268,13 +276,13 @@ def evaluate(
 
     epoch_value = mp.Value("i", 0)
     phy_dataset = LArListDataset(
-        hpge_path=str(mmpd / f'{eval_cfg["hpge_path"]}.npz'),
-        lar_paths=str(mmpd / f'{eval_cfg["phy_lar_path"]}.npz'),
+        hpge_path=str(mmpd / f'{eval_cfg["hpge_path"]}.npy'),
+        lar_paths=[str(mmpd / f'{eval_cfg["phy_lar_path"]}.npz')],
         labels=[1],
         true_coincidence_label=1,
         hpge_energy_mean=conditional_config.hpge_energy_mean,
         hpge_energy_std=conditional_config.hpge_energy_std,
-        prior=conditional_config.prior,
+        prior=[1.0],
         train_val_test_fract=conditional_config.train_val_test_fract,
         local_batch_size=eval_config.local_batch_size,
         num_t_bins=conditional_config.num_sipm_t_bins,
@@ -307,21 +315,21 @@ def evaluate(
 
     epoch_value_rc = mp.Value("i", 0)
     rc_dataset = LArListDataset(
-        hpge_path=str(mmpd / f'{eval_cfg["hpge_path"]}.npz'),
-        lar_paths=str(mmpd / f'{eval_cfg["rc_lar_path"]}.npz'),
+        hpge_path=str(mmpd / f'{eval_cfg["hpge_path"]}.npy'),
+        lar_paths=[str(mmpd / f'{eval_cfg["rc_lar_path"]}.npz')],
         labels=[0],
         true_coincidence_label=1,
         hpge_energy_mean=conditional_config.hpge_energy_mean,
         hpge_energy_std=conditional_config.hpge_energy_std,
-        prior=conditional_config.prior,
+        prior=[1.0],
         train_val_test_fract=conditional_config.train_val_test_fract,
-        local_batch_size=conditional_config.local_batch_size,
+        local_batch_size=eval_config.local_batch_size,
         num_t_bins=conditional_config.num_sipm_t_bins,
         num_sipm_chs=conditional_config.num_sipms,
         rng_seed_for_split=conditional_config.rng_seed_for_split,
         times_of_mixing=conditional_config.times_of_mixing,
         global_rng_seed_for_sampling=conditional_config.global_rng_seed_for_sampling,
-        epoch_value=epoch_value,
+        epoch_value=epoch_value_rc,
         shuffle=False,
         calib_mode=True,
         calib_dataset_frac=eval_config.calib_dataset_frac
@@ -347,6 +355,7 @@ def evaluate(
     conditional_model = ConditionalRatioEstimator(config=conditional_config, device=device).to(torch.float32)
     unconditional_model = UnconditionalRatioEstimator(config=unconditional_config, device=device).to(torch.float32)
 
+    os.makedirs(wd / "data" / experiment / "tier" / model_name / period, exist_ok=True)
     evaluator = Evaluator(
         unconditional_model=unconditional_model,
         conditional_model=conditional_model,
@@ -355,9 +364,10 @@ def evaluate(
         eval_config=eval_config,
         phy_dataloader=phy_dataloader,
         lar_dataloader=rc_dataloader,
-        save_to=str(wd / "data" / "tier" / model_name / period / "calibration.lh5"),
+        save_to=str(wd / "data" / experiment / "tier" / model_name / period / "calibration.lh5"),
         device=device
     )
+    evaluator.evaluate()
 
 if __name__ == "__main__":
     import argparse

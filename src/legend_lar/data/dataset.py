@@ -61,12 +61,12 @@ class LArDataset:
         """To be called by each worker, using a global rng seed."""
         if shuffler is None:
             if self.mode_idx in (0, 1, 2):
-                self.indices = self.shuffled_indices[self.indices_buffer.astype(np.int64)].astype(np.float32)
+                self.indices = np.array(self.shuffled_indices)[self.indices_buffer.astype(np.int64)].astype(np.float32)
             else:
                 self.indices = self.indices_buffer.astype(np.float32)
         else:
             assert len(self.indices_buffer) == len(shuffler)
-            self.indices = self.shuffled_indices[self.indices_buffer.astype(np.int64)][shuffler].astype(np.float32)
+            self.indices = np.array(self.shuffled_indices)[self.indices_buffer.astype(np.int64)][shuffler].astype(np.float32)
 
         last_batch = None
         if self.mode_idx not in (0, 1) : # no drop-last during test and calibration mode, and an unshuffled mode
@@ -101,7 +101,7 @@ class LArDataset:
     def __getitem__(self, idx: int):
         ids = self.indices[idx]
         ids = ids[~np.isnan(ids)].astype(np.int64)
-        return self.data[ids.tolist()], np.ones(self.batch_size, dtype=np.float32) * self.label, ids
+        return self.data[ids.tolist()], np.ones(len(ids), dtype=np.float32) * self.label, ids
 
 class LArListDataset(IterableDataset):
     def __init__(
@@ -243,7 +243,6 @@ class LArListDataset(IterableDataset):
 
     def set_mode(self, mode_idx: int):
         """To be called before DataLoader is intilialized in the main process."""
-        assert mode_idx in (0, 1, 2)
         self.mode = mode_idx
 
     def set_epoch(self, epoch: int):
