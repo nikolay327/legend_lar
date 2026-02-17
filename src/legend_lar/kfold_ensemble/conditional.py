@@ -8,7 +8,7 @@ cfg.autotune_local_cache = False
 from torch import Tensor
 import torch.nn.functional as F
 from torch.amp import autocast
-from bitsandbytes.optim import LAMB
+from apex.optimizers import FusedMixedPrecisionLamb
 
 from legend_lar.model import ConditionalRatioEstimator
 from legend_lar.utils import BootstrappedKFoldConfig, _initialize_configs, _init_torch, InitRNG
@@ -39,7 +39,7 @@ class ConditionalTrainer(TrainerBase):
         self.model_initiator.reinit_(self.model)
         self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
 
-        self.model_opt = LAMB(
+        self.model_opt = FusedMixedPrecisionLamb(
             params=self.model.parameters(),
             lr = self.config.lr_model,
             betas=self.config.betas_model,

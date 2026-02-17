@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-import torch._dynamo
 
 from legend_lar.utils import ModelConfig, BootstrappedKFoldConfig
 from legend_lar.model.cls import create_conditional_block, create_unconditional_block
@@ -155,7 +154,7 @@ class UnconditionalRatioEstimator(nn.Module):
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
 
-        return self.Wlogit(pooled)
+        return self.Wlogit(pooled.to(dtype=x.dtype))
 
     def tokenize_then_forward(self, x: Tensor, gE: Tensor):
         _, _, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)
