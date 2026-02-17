@@ -7,11 +7,11 @@ class CollateFn:
     def __init__(
         self,
         num_sipm_chs: int,
-        true_coincidence_label: int,
-        cuda_device: str = "cpu"
+        cuda_device: str = "cpu",
+        **kwargs
     ):
         self.num_sipm_chs = num_sipm_chs
-        self.true_coincidence_label = true_coincidence_label
+        self.true_coincidence_label = 1
 
         self.device = "cpu"
         self.cuda_device = cuda_device
