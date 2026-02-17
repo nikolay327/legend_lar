@@ -153,9 +153,8 @@ class UnconditionalRatioEstimator(nn.Module):
         pooled.index_add_(0, b_idx, x) # For each i, x[i] is added into pooled[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
-        pooled = self.Wlogit(pooled.to(dtype=x.dtype))
 
-        return pooled
+        return self.Wlogit(pooled)
 
     def tokenize_then_forward(self, x: Tensor, gE: Tensor):
         _, _, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)

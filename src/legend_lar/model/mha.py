@@ -18,8 +18,8 @@ class MHA(nn.Module):
         self.causal = causal
 
         self.attn = FlashSelfAttention(causal=self.causal)
-        self.Wqkv = nn.Linear(self.emb_dim, 3 * self.emb_dim, bias=False)
-        self.out_proj = nn.Linear(self.emb_dim, self.emb_dim, bias=False)
+        self.Wqkv = nn.Linear(self.emb_dim, 3 * self.emb_dim)
+        self.out_proj = nn.Linear(self.emb_dim, self.emb_dim)
 
     def forward(self, x: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
         qkv = self.Wqkv(x)
