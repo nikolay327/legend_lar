@@ -170,4 +170,6 @@ class TrainerBase(ABC):
             os.makedirs(fold_dir, exist_ok=True)
             np.save(f'{fold_dir}/fold_indices.npy', fold_indices)
 
-            self.train_one_bootstrap()
+            self.current_bid = -1
+            for _ in range(self.config.num_bootstraps_per_fold):
+                self.train_one_bootstrap()
