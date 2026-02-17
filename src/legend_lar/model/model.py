@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 
-from legend_lar.utils import ModelConfig
+from legend_lar.utils import ModelConfig, BootstrappedKFoldConfig
 from legend_lar.model.cls import create_conditional_block, create_unconditional_block
 from legend_lar.model.tokenizer import DiscreteEmbedder, ContinuousEmbedder, JointHPGeEmbedder
 from legend_lar.model.pos_embedding import SinPositionalEmbedding
@@ -12,7 +12,7 @@ from legend_lar.utils import pack_data
 class BCERatioEstimator(nn.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: ModelConfig | BootstrappedKFoldConfig,
         device
     ):
         super(BCERatioEstimator, self).__init__()

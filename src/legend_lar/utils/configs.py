@@ -54,6 +54,53 @@ class ModelConfig:
 
     save_to: str = None
 
+@dataclass
+class BootstrappedKFoldConfig:
+    rng_seed: int = None
+    rel_tolerance: float = None
+    patience: int = None
+    max_epochs: int = None
+
+    num_folds: int = None
+    num_bootstraps_per_fold: int = None
+
+    num_hpges: int = None
+    num_sipms: int = None
+    num_sipm_t_bins: int = None
+
+    hidden_size: int = None
+    intermediate_size: int = None
+    num_attention_heads: int = None
+
+    norm_gate_tanh_scale: float = None
+    norm_zero_init: int = None
+    
+    block_resid_dropout1: float = None
+    block_resid_dropout2: float = None
+
+    num_layers: int = None
+    causal: int = None
+
+    temperature: float = None
+    hpge_energy_mean: float = None
+    hpge_energy_std: float = None
+
+    hpge_id_and_energy: str = None
+    data_paths: list[str] = None
+    prior: list[float] = None
+    labels: list[int] = None
+
+    # Training hyperparams
+    local_batch_size: int = None
+    sg_train_val_cal_test_frac: list[float] = None
+    times_of_mixing: int = None
+
+    lr_model: float = None
+    betas_model: Tuple[float, float] = None
+    weight_decay: float = None
+
+    save_to: str = None
+
 @dataclass(frozen=True)
 class Paths:
     root: Path # working dir
@@ -89,14 +136,14 @@ def init_config(paths: Paths, experiment: str, model_name: str, version: str, mo
     return config
 
 def _initialize_configs(
-    config_obj: ModelConfig,
+    config_obj: ModelConfig | BootstrappedKFoldConfig,
     wd: Path,
     experiment: str,
     model_name: str,
     version: str,
     mmpd: Path,
     training_config: str = None
-) -> Tuple[ModelConfig, dict, Paths]:
+) -> Tuple[ModelConfig | BootstrappedKFoldConfig, dict, Paths]:
     config_json = wd / "trained" / experiment / model_name / version / f"{model_name}_{version}.json"
     os.makedirs(os.path.dirname(str(config_json)), exist_ok=True)
     if training_config is not None and not config_json.exists():

@@ -359,7 +359,6 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         global_rng_seed_for_sampling: int = None,
         num_folds: int = None,
         num_bootstraps_per_fold: int = None,
-        bg_train_val_frac: list[float] = None,
         sg_train_val_cal_test_frac: list[float] = None,
         mode: mp.Value | int = 4,
         fold_id: mp.Value = None,
@@ -375,7 +374,6 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         self.num_folds = num_folds # == K
         self.num_bootstraps_per_fold = num_bootstraps_per_fold
         
-        self.bg_train_val_frac = bg_train_val_frac
         self.sg_train_val_cal_test_frac = sg_train_val_cal_test_frac
         self.rng_seed_for_split = rng_seed_for_split
         self.times_of_mixing = times_of_mixing
@@ -418,10 +416,15 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         with self.mode.get_lock():
             self.mode.value = mode
 
-    def _set_fold_id(self, fold_id: int):
+    def set_fold_id(self, fold_id: int):
         """Called inside main process"""
         with self.fold_id.get_lock():
             self.fold_id.value = fold_id
+
+    def set_bid_flag(self, bid_flag: int):
+        """Called inside main process"""
+        with self.change_bootstrap_id.get_lock():
+            self.change_bootstrap_id.value = bid_flag
 
     def _set_stratified_batch_sizes(self):
         """
@@ -489,19 +492,14 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
                 bg_train_and_val_folds.append(
                     permuted_indices[mask].tolist()
                 )
-            bg_data_cumsums = [
-                self._get_data_chunks_cumsum(len(bg_train_and_val_fold), self.bg_train_val_frac).tolist() for bg_train_and_val_fold in bg_train_and_val_folds
-            ]
 
             self.indices = {
                 "sg": {
-                    "cumsum": sg_data_cumsum.tolist(),
                     "train_val": self.mixed_indices[self.labels == 0][:sg_data_cumsum[2]].tolist(),
                     "calib": self.mixed_indices[self.labels == 0][sg_data_cumsum[2]:sg_data_cumsum[3]].tolist(),
                     "test": self.mixed_indices[self.labels == 0][sg_data_cumsum[3]:sg_data_cumsum[4]].tolist()
                 },
                 "bg": {
-                    "cumsum": bg_data_cumsums,
                     "test_folds": {
                         'fold_{k}'.format(k=k): test_folds[k] for k in range(self.num_folds)
                     },
@@ -582,6 +580,8 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         self.current_bg_val = bg_fold[bg_oob_idx]
 
         self.current_bg_test_fold = np.array(self.indices["bg"]["test_folds"]['fold_{i}'.format(i=int(self.fold_id.value))])
+
+        self.set_bid_flag(0)
 
     def _shuffle(self):
         """To be called by each worker, using a global rng seed."""
