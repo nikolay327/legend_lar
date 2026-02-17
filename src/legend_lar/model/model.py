@@ -148,8 +148,6 @@ class UnconditionalRatioEstimator(nn.Module):
             )
         x = self.norm(residual + x) # (N, D)
 
-        print("I'm here")
-
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
         B = int(b_idx.max().item()) + 1
         pooled = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum

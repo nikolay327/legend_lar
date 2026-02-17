@@ -8,19 +8,19 @@ def train_kfold_ensemble(
     data_dir: str,
     base_config: str
 ):
-    train_unconditional(
+    train_conditional(
         experiment=experiment,
         model_name=model_name,
-        version="unconditional",
+        version="conditional",
         working_dir=working_dir,
         data_dir=data_dir,
         training_config=base_config
     )
 
-    train_conditional(
+    train_unconditional(
         experiment=experiment,
         model_name=model_name,
-        version="conditional",
+        version="unconditional",
         working_dir=working_dir,
         data_dir=data_dir,
         training_config=base_config
