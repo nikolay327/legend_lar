@@ -482,7 +482,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
             test_folds = permuted_indices[:num_data_within_folds * self.num_folds]
             test_folds = test_folds.reshape(self.num_folds, -1).tolist()
             if is_incomplete_last_fold:
-                test_folds.append(permuted_indices[:num_data_within_folds * self.num_folds].tolist())
+                test_folds.append(permuted_indices[num_data_within_folds * self.num_folds:].tolist())
 
             bg_train_and_val_folds = []
             for test_fold in test_folds:
