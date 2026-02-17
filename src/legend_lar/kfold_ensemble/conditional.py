@@ -37,7 +37,7 @@ class ConditionalTrainer(TrainerBase):
             device=self.device
         ).to(dtype=torch.float32, device=self.device)
         self.model_initiator.reinit_(self.model)
-        self.model = torch.compile(self.model, dynamic=True)
+        self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
 
         self.model_opt = LAMB(
             params=self.model.parameters(),
