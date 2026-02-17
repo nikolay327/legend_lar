@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
+import torch._dynamo
 
 from legend_lar.utils import ModelConfig, BootstrappedKFoldConfig
 from legend_lar.model.cls import create_conditional_block, create_unconditional_block
@@ -124,6 +125,10 @@ class UnconditionalRatioEstimator(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(self.config.intermediate_size, 1)
         )
+    
+    @torch._dynamo.disable
+    def run_head(self, x: Tensor):
+        return self.Wlogit(x)
 
     def forward(
         self,
@@ -148,13 +153,13 @@ class UnconditionalRatioEstimator(nn.Module):
         x = self.norm(residual + x) # (N, D)
 
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
-        B = b_idx.max().detach().cpu().item() + 1
+        B = int(b_idx.max().item()) + 1
         pooled = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
         pooled.index_add_(0, b_idx, x) # For each i, x[i] is added into pooled[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
 
-        return self.Wlogit(pooled)
+        return self.run_head(pooled)
 
     def tokenize_then_forward(self, x: Tensor, gE: Tensor):
         _, _, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)
@@ -219,7 +224,7 @@ class ConditionalRatioEstimator(nn.Module):
         x = self.norm(residual + x) # (N, D)
 
         # Mean pooling, so that the pooled token is permutation-invariant within any multiset
-        B = b_idx.max().detach().cpu().item() + 1
+        B = int(b_idx.max().item()) + 1
         anchors = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
         anchors.index_add_(0, b_idx, x) # For each i, x[i] is added into anchors[b_idx[i]]
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1) # (B,1) the total number of pe in a batch entry
