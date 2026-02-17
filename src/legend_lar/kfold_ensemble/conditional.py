@@ -12,7 +12,6 @@ from bitsandbytes.optim import LAMB
 
 from legend_lar.model import ConditionalRatioEstimator
 from legend_lar.utils import BootstrappedKFoldConfig, _initialize_configs, _init_torch, InitRNG
-from legend_lar.data import BootstrappedKFoldLArListDataset
 
 from legend_lar.kfold_ensemble.base import TrainerBase
 
@@ -37,7 +36,7 @@ class ConditionalTrainer(TrainerBase):
             config=self.config,
             device=self.device
         ).to(dtype=torch.float32, device=self.device)
-        self.model_initiator(self.model)
+        self.model_initiator.reinit_(self.model)
         self.model = torch.compile(self.model, dynamic=True)
 
         self.model_opt = LAMB(
@@ -157,7 +156,7 @@ def train_conditional(experiment: str, model_name: str, version: str, working_di
     mmpd = Path(data_dir)
 
     config, data_config, paths = _initialize_configs(
-        config_obj=BootstrappedKFoldLArListDataset(),
+        config_obj=BootstrappedKFoldConfig(),
         wd=wd,
         experiment=experiment,
         model_name=model_name,

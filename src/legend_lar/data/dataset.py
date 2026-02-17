@@ -359,14 +359,14 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         num_folds: int = None,
         num_bootstraps_per_fold: int = None,
         sg_train_val_cal_test_frac: list[float] = None,
-        mode: mp.Value | int = 4,
+        mode: mp.Value = None, # can be an int when mode == 4 (evaluation mode)
         fold_id: mp.Value = None,
         change_bootstrap_id: mp.Value = None
     ):
         """
             self.mixed_indices is treated as a first global shuffle before the data is K-folded
         """
-        super(LArListDataset, self).__init__()
+        super(BootstrappedKFoldLArListDataset, self).__init__()
         assert len(lar_paths) == len(prior) == len(labels)
         assert sum(prior) == 1.0
 
@@ -410,7 +410,8 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
             if mode != 4:
                 raise ValueError("cannot change from evaluation mode to other modes")
         else:
-            raise ValueError("cannot change from other modes to evaluation mode")
+            if mode == 4:
+                raise ValueError("cannot change from other modes to evaluation mode")
 
         with self.mode.get_lock():
             self.mode.value = mode
@@ -434,7 +435,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         if stratified_batch_sizes.sum() != self.batch_size:
             stratified_batch_sizes[-1] = stratified_batch_sizes[-1] + self.batch_size - stratified_batch_sizes.sum()
         self.prior = (stratified_batch_sizes / np.sum(stratified_batch_sizes)).tolist()
-        self.stratified_batch_sizes = self.stratified_batch_sizes.astype(np.int64).tolist()
+        self.stratified_batch_sizes = stratified_batch_sizes.astype(np.int64).tolist()
 
     def _set_mixed_indices(self):
         # Monotonicly increasing default indices
@@ -453,7 +454,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         self.mixed_indices = mixed_indices
 
     def _get_data_chunks_cumsum(self, data_len: int, chunk_fractions: list[float] = None):
-        if chunk_fraction is None:
+        if chunk_fractions is None:
             return np.array(0, data_len, dtype=np.int64)
         chunk_lens = [0]
         for i, chunk_fraction in enumerate(chunk_fractions):
@@ -467,16 +468,15 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
     def _set_folds_indices(self):
         self.labels = np.array(self.labels)
         if self.mode == 4:
-            self.indices = np.arange(np.array(self.data_lengths, dtype=np.int64)[self.labels == 0], dtype=np.int64).tolist()
+            self.indices = np.arange(int(np.array(self.data_lengths, dtype=np.int64)[self.labels == 0][0]), dtype=np.int64).tolist()
             return
 
         # label 0 data (sg / RC dataset) is treated to have 1 fold
-        sg_data_cumsum = self._get_data_chunks_cumsum(np.array(self.data_lengths, dtype=np.int64)[self.labels == 0], self.sg_train_val_cal_test_frac)
+        sg_data_cumsum = self._get_data_chunks_cumsum(int(np.array(self.data_lengths, dtype=np.int64)[self.labels == 0][0]), self.sg_train_val_cal_test_frac)
 
         if 1 in self.labels:
-            self.mixed_indices = np.array(self.mixed_indices, dtype=np.int64)
             # label 1 data with k folds (bg / physics)
-            permuted_indices = self.mixed_indices[self.labels == 1]
+            permuted_indices = np.array(self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 1][0]], dtype=np.int64)
             num_data_within_folds = len(permuted_indices) // self.num_folds
             is_incomplete_last_fold = num_data_within_folds * self.num_folds != len(permuted_indices)
             test_folds = permuted_indices[:num_data_within_folds * self.num_folds]
@@ -486,7 +486,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
 
             bg_train_and_val_folds = []
             for test_fold in test_folds:
-                mask = np.ones(len(permuted_indices)).astype(np.bool)
+                mask = np.ones(len(permuted_indices)).astype(np.bool_)
                 mask[test_fold] = False
                 bg_train_and_val_folds.append(
                     permuted_indices[mask].tolist()
@@ -494,9 +494,9 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
 
             self.indices = {
                 "sg": {
-                    "train_val": self.mixed_indices[self.labels == 0][:sg_data_cumsum[2]].tolist(),
-                    "calib": self.mixed_indices[self.labels == 0][sg_data_cumsum[2]:sg_data_cumsum[3]].tolist(),
-                    "test": self.mixed_indices[self.labels == 0][sg_data_cumsum[3]:sg_data_cumsum[4]].tolist()
+                    "train_val": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][:sg_data_cumsum[2]],
+                    "calib": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][sg_data_cumsum[2]:sg_data_cumsum[3]],
+                    "test": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][sg_data_cumsum[3]:sg_data_cumsum[4]]
                 },
                 "bg": {
                     "test_folds": {
@@ -510,13 +510,11 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         else:
             self.indices = {
                 "sg": {
-                    "cumsum": sg_data_cumsum.tolist(),
-                    "train_val": self.mixed_indices[self.labels == 0][:sg_data_cumsum[2]].tolist(),
-                    "calib": self.mixed_indices[self.labels == 0][sg_data_cumsum[2]:sg_data_cumsum[3]].tolist(),
-                    "test": self.mixed_indices[self.labels == 0][sg_data_cumsum[3]:sg_data_cumsum[4]].tolist()
+                    "train_val": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][:sg_data_cumsum[2]],
+                    "calib": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][sg_data_cumsum[2]:sg_data_cumsum[3]],
+                    "test": self.mixed_indices[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]][sg_data_cumsum[3]:sg_data_cumsum[4]]
                 }
             }
-        self.mixed_indices = self.mixed_indices.tolist()
         self.labels = self.labels.tolist()
 
     def _set_sg_and_bg_datasets(self):
@@ -529,11 +527,11 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
             self.hpge_dataset = None
 
         self.dataset = [
-            LArDatasetBase(self.lar_paths[self.labels[self.labels == 0]]) # signal
+            LArDatasetBase(self.lar_paths[np.array([0, 1], dtype=np.int64)[self.labels == 0][0]]) # signal
         ]
         if 1 in self.labels:
             self.dataset.append(
-                LArDatasetBase(load_npz(self.lar_paths[self.labels[self.labels == 1]])) # background
+                LArDatasetBase(self.lar_paths[np.array([0, 1], dtype=np.int64)[self.labels == 1][0]]) # background
             )
 
     def _worker_init(self):
@@ -560,7 +558,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         n_sg = len(sg_fold)
         sg_boot_idx = self.bootstrap_rng.choice(n_sg, size=n_sg, replace=True)
         sg_inbag_unique = np.unique(sg_boot_idx)
-        sg_oob_mask = np.ones(n_sg, dtype=np.bool)
+        sg_oob_mask = np.ones(n_sg, dtype=np.bool_)
         sg_oob_mask[sg_inbag_unique] = False
         sg_oob_idx = np.flatnonzero(sg_oob_mask)
 
@@ -571,7 +569,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         n_bg = len(bg_fold)
         bg_boot_idx = self.bootstrap_rng.choice(n_bg, size=n_bg, replace=True)
         bg_inbag_unique = np.unique(bg_boot_idx)
-        bg_oob_mask = np.ones(n_bg, dtype=np.bool)
+        bg_oob_mask = np.ones(n_bg, dtype=np.bool_)
         bg_oob_mask[bg_inbag_unique] = False
         bg_oob_idx = np.flatnonzero(bg_oob_mask)
 
@@ -579,8 +577,6 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         self.current_bg_val = bg_fold[bg_oob_idx]
 
         self.current_bg_test_fold = np.array(self.indices["bg"]["test_folds"]['fold_{i}'.format(i=int(self.fold_id.value))])
-
-        self.set_bid_flag(0)
 
     def _shuffle(self):
         """
@@ -642,19 +638,25 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         for idx in range(len(self)):
             batch = []
             labels = []
+            indices = []
             for i in range(len(self.labels)):
                 indices_shard = self.current_indices[i][idx]
                 partial_batch, indices_shard = self.dataset[i][indices_shard]
                 partial_label = np.ones(len(indices_shard), dtype=np.float32) * self.labels[i]
                 batch.append(partial_batch.toarray().reshape(-1, self.num_t_bins, self.num_sipm_chs))
                 labels.append(partial_label)
-
-            batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+                indices.append(indices_shard)
+            
             if self.hpge_dataset is not None:
-                gE = self.hpge_dataset[labels[1]]
+                index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
+                batch = batch[index]
+                gE = self.hpge_dataset[indices[index]]
+                labels = labels[index]
             else:
-                gE = np.zeros((len(batch), 2), dtype=np.float32)
-            labels = np.concatenate(labels, axis=0) if len(labels) > 0 else labels[0]
+                index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
+                gE = np.zeros((len(batch[index]), 2), dtype=np.float32)
+                batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+                labels = np.concatenate(labels, axis=0) if len(labels) > 1 else labels[0]
             yield batch, gE, labels
 
 def KFoldBootstrap_worker_init_fn(worker_id: int):

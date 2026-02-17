@@ -51,9 +51,9 @@ class TrainerBase(ABC):
         self.val_loss = []
 
     def _init_dataloader(self):
-        self.mode_value = mp.Value("mode_value", 0)
-        self.fid_value = mp.Value("fid_value", 0)
-        self.change_bootstrap_id_value = mp.Value("change_bootstrap_id_value", 1)
+        self.mode_value = mp.Value("i", 0)
+        self.fid_value = mp.Value("i", 0)
+        self.change_bootstrap_id_value = mp.Value("i", 1)
 
         self.dataset = BootstrappedKFoldLArListDataset(
             lar_paths=self.config.data_paths,
@@ -116,102 +116,20 @@ class TrainerBase(ABC):
         }, f'{save_dir}/model.pt')
 
     @abstractmethod
-    def train_batch(
-        self,
-        b_idx: Tensor,
-        t_idx: Tensor,
-        s_idx: Tensor,
-        cu_seqlens: Tensor,
-        max_seqlen: int,
-        lengths: Tensor,
-        labels: Tensor
-    ):
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = self.model(
-                b_idx=b_idx,
-                t_idx=t_idx,
-                s_idx=s_idx,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                lengths=lengths
-            ).squeeze(-1)
-        logits = logits.to(dtype=torch.float32)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
-
-        self.model_opt.zero_grad()
-        loss.backward()
-        self.model_opt.step()
-
-        return loss.detach().cpu().item()
+    def train_batch(self):
+        pass
 
     @abstractmethod
     def train_epoch(self):
-        loss = 0.
-        n_step = 0
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.dataloader:
-            g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-            E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
-            loss_ = self.train_batch(
-                b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.int32),
-                max_seqlen=int(max_seqlen),
-                lengths=lengths.to(device=self.device, non_blocking=True),
-                labels=labels.to(device=self.device, non_blocking=True)
-            )
-            loss += loss_
-            n_step += 1
-
-        n_step = 1 / n_step
-        self.train_loss.append(loss * n_step)
+        pass
 
     @abstractmethod
-    def val_batch(
-        self,
-        b_idx: Tensor,
-        t_idx: Tensor,
-        s_idx: Tensor,
-        cu_seqlens: Tensor,
-        max_seqlen: int,
-        lengths: Tensor,
-        labels: Tensor
-    ):
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = self.model(
-                b_idx=b_idx,
-                t_idx=t_idx,
-                s_idx=s_idx,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                lengths=lengths
-            ).squeeze(-1)
-        logits = logits.to(dtype=torch.float32)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
-
-        return loss.detach().cpu().item()
+    def val_batch(self):
+        pass
 
     @abstractmethod
     def val_epoch(self):
-        loss = 0.
-        n_step = 0
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, labels in self.dataloader:
-            g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
-            loss_ = self.val_batch(
-                b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.int32),
-                max_seqlen=int(max_seqlen),
-                lengths=lengths.to(device=self.device, non_blocking=True),
-                labels=labels.to(device=self.device, non_blocking=True)
-            )
-            loss += loss_
-            n_step += 1
-
-        n_step = 1 / n_step
-        self.val_loss.append(loss * n_step)
+        pass
 
     def train_one_bootstrap(self):
         self.dataloader.dataset.set_bid_flag(1) # instruct the workers to create a fresh bootstrap of the current fold
@@ -223,6 +141,7 @@ class TrainerBase(ABC):
             self.dataloader.dataset.set_mode(0) # training mode
             self.model.train()
             self.train_epoch()
+            self.dataloader.dataset.set_bid_flag(0) # instruct the workers to not create a fresh bootstrap of the current fold anymore
 
             self.dataloader.dataset.set_mode(1) # validation mode
             self.model.eval()
@@ -240,6 +159,7 @@ class TrainerBase(ABC):
 
             if self.patience == self.config.patience:
                 break
+        self.best_val_loss = 9999.
 
     def train_folds(self):
         for fid in range(self.config.num_folds):
