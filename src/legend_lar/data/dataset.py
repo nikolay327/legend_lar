@@ -1,4 +1,3 @@
-from functools import cache
 import math
 import multiprocessing as mp
 import traceback
@@ -584,7 +583,11 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         self.set_bid_flag(0)
 
     def _shuffle(self):
-        """To be called by each worker, using a global rng seed."""
+        """
+            To be called by each worker, using a global rng seed.
+            NOTE: both the sg and bg datasets need to always be loaded and bootstrapped together for consistency
+        """
+
         if self.mode.value == 0:
             self.current_indices = [
                 self.current_sg_train[self.sampling_rng.permutation(len(self.current_sg_train))].astype(np.float32),

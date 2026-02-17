@@ -6,8 +6,7 @@ def train_kfold_ensemble(
     model_name: str,
     working_dir: str,
     data_dir: str,
-    unconditional_base_config: str,
-    conditional_base_config: str
+    base_config: str
 ):
     train_unconditional(
         experiment=experiment,
@@ -15,7 +14,7 @@ def train_kfold_ensemble(
         version="unconditional",
         working_dir=working_dir,
         data_dir=data_dir,
-        training_config=unconditional_base_config
+        training_config=base_config
     )
 
     train_conditional(
@@ -24,7 +23,7 @@ def train_kfold_ensemble(
         version="conditional",
         working_dir=working_dir,
         data_dir=data_dir,
-        training_config=conditional_base_config
+        training_config=base_config
     )
 
 if __name__ == "__main__":
@@ -34,8 +33,7 @@ if __name__ == "__main__":
     parser.add_argument("model_name", type=str, help="Name of the model being trained")
     parser.add_argument("working_dir", type=str, help="Top-most dir of the training pipeline")
     parser.add_argument("data_dir", type=str, help="Directory the training data is saved under")
-    parser.add_argument("unconditional_base_config", type=str)
-    parser.add_argument("conditional_base_config", type=str)
+    parser.add_argument("base_config", type=str)
     parser.add_argument("cache_dir", type=str, help="Directory to store torch.inductor and triton cache")
     args = parser.parse_args()
 
@@ -54,4 +52,4 @@ if __name__ == "__main__":
 
     JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
 
-    train_kfold_ensemble(args.experiment, args.model_name, args.working_dir, args.data_dir, args.unconditional_base_config, args.conditional_base_config)
+    train_kfold_ensemble(args.experiment, args.model_name, args.working_dir, args.data_dir, args.base_config)
