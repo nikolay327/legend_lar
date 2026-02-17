@@ -73,7 +73,7 @@ class UnconditionalTrainer(TrainerBase):
         loss.backward()
         self.model_opt.step()
 
-        return loss.detach().cpu().item()
+        return loss.detach().item()
 
     def train_epoch(self):
         loss = 0.
@@ -119,7 +119,7 @@ class UnconditionalTrainer(TrainerBase):
         logits = logits.to(dtype=torch.float32)
         loss = F.binary_cross_entropy_with_logits(logits, labels)
 
-        return loss.detach().cpu().item()
+        return loss.detach().item()
 
     def val_epoch(self):
         loss = 0.

@@ -77,7 +77,7 @@ class ConditionalTrainer(TrainerBase):
         loss.backward()
         self.model_opt.step()
 
-        return loss.detach().cpu().item()
+        return loss.detach().item()
 
     def train_epoch(self):
         loss = 0.
@@ -127,7 +127,7 @@ class ConditionalTrainer(TrainerBase):
         labels = labels.to(dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels, reduction="mean")
 
-        return loss.cpu().item()
+        return loss.item()
 
     def val_epoch(self):
         loss = 0.
