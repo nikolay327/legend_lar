@@ -22,4 +22,4 @@ class SinPositionalEmbedding(nn.Module):
         self.register_buffer('pe', pe) # (L, D)
     
     def forward(self, x: Tensor, ids: Tensor):
-        return x + self.pe[ids]
+        return x + self.pe[ids].to(dtype=x.dtype)

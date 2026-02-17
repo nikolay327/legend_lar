@@ -125,10 +125,6 @@ class UnconditionalRatioEstimator(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(self.config.intermediate_size, 1)
         )
-    
-    @torch._dynamo.disable
-    def run_head(self, x: Tensor):
-        return self.Wlogit(x)
 
     def forward(
         self,
@@ -159,7 +155,7 @@ class UnconditionalRatioEstimator(nn.Module):
         num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1)  # (B,1) the total number of pe in a batch entry
         pooled = pooled / num_pe # (B, D)
 
-        return self.run_head(pooled)
+        return self.Wlogit(pooled)
 
     def tokenize_then_forward(self, x: Tensor, gE: Tensor):
         _, _, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths = pack_data(x, gE, zero_token_id=self.config.num_sipms)
