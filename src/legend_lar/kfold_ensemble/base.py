@@ -160,6 +160,8 @@ class TrainerBase(ABC):
             if self.patience == self.config.patience:
                 break
         self.best_val_loss = 9999.
+        self.patience = 0
+        self._init_loss_store()
 
     def train_folds(self):
         for fid in range(self.config.num_folds):
