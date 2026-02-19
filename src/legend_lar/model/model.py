@@ -256,3 +256,77 @@ class ConditionalRatioEstimator(nn.Module):
         logits = (anchors @ e_hpge.t()) / self.config.temperature # (B, B)
         labels = torch.arange(logits.size(0), device=logits.device) # (B,)
         return logits, labels
+
+class ContrastiveRatioEstimator(ConditionalRatioEstimator):
+    def __init__(
+        self,
+        config: ModelConfig,
+        device
+    ):
+        super(ContrastiveRatioEstimator, self).__init__(config, device)
+    
+    def forward(
+        self,
+        g: Tensor, # (B / 2,)
+        E: Tensor, # (B / 2,)
+        b_idx: Tensor, # (N,)
+        t_idx: Tensor, # (N,)
+        s_idx: Tensor, # (N,)
+        cu_seqlens: Tensor, # (N+1,)
+        max_seqlen: int,
+        lengths: Tensor, # (N,)
+        e_hpge_: Tensor = None # (B / 2, D)
+    ) -> Tensor:
+        if e_hpge_ is None:
+            e_hpge = self.joint_hpge_emb(g, E) # (B / 2, D)
+
+        x = self.sipm_emb(s_idx) # (N, D)
+        x = self.time_emb(x, t_idx)
+        residual = None
+        for block in self.blocks:
+            x, residual = block(
+                hidden_states=x,
+                residual=residual,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen
+            )
+        x = self.norm(residual + x) # (N, D)
+
+        # Mean pooling, so that the pooled token is permutation-invariant within any multiset
+        B = int(b_idx.max().item()) + 1
+        anchors = x.new_zeros((B, self.config.hidden_size)) # (B, D) zero-tensor to accumulate the sum
+        anchors.index_add_(0, b_idx, x) # For each i, x[i] is added into anchors[b_idx[i]]
+        num_pe = lengths.to(x.dtype).clamp_min(1).unsqueeze(1) # (B,1) the total number of pe in a batch entry
+        anchors = anchors / num_pe # (B, D)
+
+        anchors = F.normalize(anchors, p=2, dim=-1) # (B, D)
+        e_hpge = F.normalize(e_hpge, p=2, dim=-1) if e_hpge_ is None else e_hpge_ # (B / 2, D)
+        return anchors, e_hpge
+
+    def training_forward(
+        self,
+        g: Tensor, # (B,)
+        E: Tensor, # (B,)
+        b_idx: Tensor, # (N,)
+        t_idx: Tensor, # (N,)
+        s_idx: Tensor, # (N,)
+        cu_seqlens: Tensor, # (N+1,)
+        max_seqlen: int,
+        lengths: Tensor # (N,)
+    ):
+        anchors, e_hpge = self.forward(
+            g=g,
+            E=E,
+            b_idx=b_idx,
+            t_idx=t_idx,
+            s_idx=s_idx,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            lengths=lengths
+        )
+        # Positives
+        pos_logits = (anchors[:len(g)] * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B / 2, 1)
+        neg_logits = (anchors[len(g):] @ e_hpge.t()) / self.config.temperature # (B / 2, B / 2)
+        logits = torch.cat([pos_logits, neg_logits], dim=-1) # (B / 2, B / 2 + 1)
+        labels = torch.zeros(logits.size(0), device=logits.device) # (B,)
+        return logits, labels

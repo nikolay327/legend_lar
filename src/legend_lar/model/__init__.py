@@ -1,7 +1,8 @@
-from .model import BCERatioEstimator, ConditionalRatioEstimator, UnconditionalRatioEstimator
+from .model import BCERatioEstimator, ConditionalRatioEstimator, UnconditionalRatioEstimator, ContrastiveRatioEstimator
 
 __all__ = [
     "BCERatioEstimator",
     "ConditionalRatioEstimator",
-    "UnconditionalRatioEstimator"
+    "UnconditionalRatioEstimator",
+    "ContrastiveRatioEstimator"
 ]

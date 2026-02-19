@@ -9,11 +9,8 @@ import torch
 import torch._inductor.config as cfg
 cfg.autotune_local_cache = False
 
-from torch import Tensor
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
-from torch.amp import autocast
 
 from legend_lar.utils import BootstrappedKFoldConfig
 from legend_lar.data import BootstrappedKFoldLArListDataset, CollateFn, KFoldBootstrap_worker_init_fn

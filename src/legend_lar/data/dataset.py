@@ -361,7 +361,8 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         sg_train_val_cal_test_frac: list[float] = None,
         mode: mp.Value = None, # can be an int when mode == 4 (evaluation mode)
         fold_id: mp.Value = None,
-        change_bootstrap_id: mp.Value = None
+        change_bootstrap_id: mp.Value = None,
+        load_both_indices: bool = False
     ):
         """
             self.mixed_indices is treated as a first global shuffle before the data is K-folded
@@ -396,6 +397,8 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
         # NOTE: in evaluation mode (4), data is not chunked and is not bootstrapped
         self.fold_id = fold_id
         self.change_bootstrap_id = change_bootstrap_id
+
+        self.load_both_indices = load_both_indices
 
         self._set_stratified_batch_sizes()
         self._set_mixed_indices()
@@ -649,9 +652,13 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
             
             if self.hpge_dataset is not None:
                 index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
-                batch = batch[index]
+                if self.load_both_indices:
+                    batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+                    labels = np.concatenate(labels, axis=0) if len(labels) > 1 else labels[0]
+                else:
+                    batch = batch[index]
+                    labels = labels[index]
                 gE = self.hpge_dataset[indices[index]]
-                labels = labels[index]
             else:
                 index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
                 gE = np.zeros((len(batch[index]), 2), dtype=np.float32)
