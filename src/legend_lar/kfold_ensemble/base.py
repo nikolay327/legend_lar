@@ -19,10 +19,12 @@ class TrainerBase(ABC):
     def __init__(
         self,
         config: BootstrappedKFoldConfig,
-        device: str | int
+        device: str | int,
+        load_both_indices: bool = False
     ):
         self.device = device
         self.config = config
+        self.load_both_indices = load_both_indices
         self._init_loss_store()
 
         self.BASE_SEED = self.config.rng_seed
@@ -71,7 +73,8 @@ class TrainerBase(ABC):
             sg_train_val_cal_test_frac=self.config.sg_train_val_cal_test_frac,
             mode=self.mode_value,
             fold_id=self.fid_value,
-            change_bootstrap_id=self.change_bootstrap_id_value
+            change_bootstrap_id=self.change_bootstrap_id_value,
+            load_both_indices=self.load_both_indices
         )
         self.collate_fn = CollateFn(
             num_sipm_chs=self.config.num_sipms,

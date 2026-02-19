@@ -21,7 +21,7 @@ class ContrastiveTrainer(TrainerBase):
         config: BootstrappedKFoldConfig,
         device: str | int
     ):
-        super(ContrastiveTrainer, self).__init__(config, device)
+        super(ContrastiveTrainer, self).__init__(config, device, True)
 
     def _set_model_initializer(self):
         self.rng_seed_for_unconditional_model_init = self.BASE_RNG.getrandbits(64) # This is here for consistency
