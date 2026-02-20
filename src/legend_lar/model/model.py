@@ -325,8 +325,8 @@ class ContrastiveRatioEstimator(ConditionalRatioEstimator):
             lengths=lengths
         )
         # Positives
-        pos_logits = (anchors[:len(g)] * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B / 2, 1)
-        neg_logits = (anchors[len(g):] @ e_hpge.t()) / self.config.temperature # (B / 2, B / 2)
+        pos_logits = (anchors[len(g):] * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B / 2, 1)
+        neg_logits = (anchors[:len(g)] @ e_hpge.t()) / self.config.temperature # (B / 2, B / 2)
         logits = torch.cat([pos_logits, neg_logits], dim=-1) # (B / 2, B / 2 + 1)
         labels = torch.zeros(logits.size(0), device=logits.device) # (B,)
         return logits, labels

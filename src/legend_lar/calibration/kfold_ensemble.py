@@ -47,11 +47,9 @@ class Evaluator:
 
         self._init_cal_dataloader()
         self._init_phy_dataloader()
-        self.load_ensemble()
-        self.cache_null_anchors()
 
     def _init_phy_dataloader(self):
-        test_folds = [np.load(f'{self.model_dir}/fid_{i}/fold_indices.npy').astype(np.float64).tolist() for i in range(len(self.config.num_folds))]
+        test_folds = [np.load(f'{self.model_dir}/fid_{i}/fold_indices.npy').astype(np.float64).tolist() for i in range(self.config.num_folds)]
         self.phy_dataset = BootstrappedKFoldLArListDataset(
             lar_paths=self.config.data_paths,
             num_t_bins=self.config.num_sipm_t_bins,
@@ -137,8 +135,8 @@ class Evaluator:
 
             cp = torch.load(f'{self.model_dir}/fid_{fid}/bid_{i}/model.pt', map_location=self.device)
             model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
+            model = torch.compile(model, mode="reduce-overhead", dynamic=True)
             self.ensemble.append(model)
-        self.ensemble = torch.compile(self.ensemble, mode="reduce-overhead", dynamic=True)
         torch.cuda.empty_cache()
 
     @torch.no_grad()
@@ -168,12 +166,13 @@ class Evaluator:
                         lengths=lengths
                     )
                     # append the last incomplete batch with nans
-                    if len(anchors) != self.config.local_batch_size / 2:
-                        tail = torch.zeros((self.config.local_batch_size // 2 - len(anchors), self.config.hidden_size), dtype=anchors.dtype, device=self.device).fill_(float("nan"))
+                    B = self.config.local_batch_size // 2
+                    if len(anchors) != B:
+                        tail = torch.zeros((B - len(anchors), self.config.hidden_size), dtype=anchors.dtype, device=self.device).fill_(float("nan"))
                         anchors = torch.cat([anchors, tail])
                     null_anchor_buffer.append(anchors.reshape(1, -1, self.config.hidden_size)) # (1, B, D)
         null_anchor_buffer = torch.cat(null_anchor_buffer, dim=0).to(dtype=torch.float32)
-        null_anchor_buffer = null_anchor_buffer.reshape(-1, self.config.num_bootstraps_per_fold, self.config.hidden_size) # (-1, n_ensemble, B, D)
+        null_anchor_buffer = null_anchor_buffer.reshape(-1, self.config.num_bootstraps_per_fold, B, self.config.hidden_size) # (-1, n_ensemble, B, D)
         return null_anchor_buffer
 
     def cache_null_anchors(self):
@@ -242,6 +241,9 @@ class Evaluator:
                 null_logits.append(null_logits_)
             null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
             null_logits = torch.nansum(null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
+            keep = ~torch.isnan(e_hpge[0]).all(dim=-1)
+            null_logits = null_logits[keep]
+
             bias_estimator = torch.logsumexp(null_logits, dim=-1) # (B,) an estimator to the infoNCE bias term
 
             # Calculate the test statistic under the heldout null for each event
@@ -252,33 +254,30 @@ class Evaluator:
                 heldout_null_logits.append(null_logits_)
             heldout_null_logits = torch.cat(heldout_null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
             heldout_null_logits = torch.nansum(heldout_null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-
-            # Take into account 0 pe and > 100 pe events
-            N_rc_data = null_logits.shape[1]
-            N_tot = N_rc_data + self.eval_config.num_zero_pe_in_lar_ft + self.eval_config.num_high_pe_in_lar_ft
-            q = ((1 - self.eval_config.alpha) * N_tot - self.eval_config.num_zero_pe_in_lar_ft) / N_rc_data
-            q = float(max(0.0, min(1.0, q)))
+            heldout_null_logits = heldout_null_logits[keep]
 
             # Calculate the cut value
-            cut = torch.quantile(null_logits, q, dim=-1) # (B,)
-            is_accepted = (logits <= cut).to(torch.float32)
+            cut = torch.quantile(null_logits, self.eval_config.alpha, dim=-1) # (B,)
+            # is_accepted = (logits <= cut).to(torch.float32)
             # Calculate calibrated p-value
-            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + self.eval_config.num_high_pe_in_lar_ft + 1) / (N_rc_data + self.eval_config.num_zero_pe_in_lar_ft + 1) # (B,)
+            N_rc_data = null_logits.shape[1]
+            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,), # (B, N_rc_data)
 
             # Calculate the calibrated p-val under the heldout null (do it in batches)
+            sorted_null = null_logits.sort(dim=-1).values # (B, N_rc_data)
             heldout_null_logits_len = heldout_null_logits.shape[1]
             num_iters = math.ceil(heldout_null_logits_len / self.config.local_batch_size)
             null_p_val = []
             for it in range(num_iters):
                 # (B, local_batch_size)
                 heldout_batch = heldout_null_logits[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_logits_len else heldout_null_logits[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
-                null_p_val_ = null_logits.unsqueeze(1) >= heldout_batch.unsqueeze(2) # (B, 1, N_rc_data) > (B, local_batch_size, 1) -> (B, local_batch_size, N_rc_data)
-                null_p_val_ = (null_p_val_.float().sum(dim=-1) + self.eval_config.num_high_pe_in_lar_ft + 1) / (N_rc_data + self.eval_config.num_zero_pe_in_lar_ft + 1) # (B, local_batch_size)
-                null_p_val.append()
+                idx = torch.searchsorted(sorted_null, heldout_batch, right=False)  # (B, lb)
+                null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
+                null_p_val.append(null_p_val_)
             null_p_val = torch.cat(null_p_val, dim=-1) # (B, heldout_null_logits_len)
 
             cut = cut.cpu().numpy() # (B,)
-            is_accepted = is_accepted.cpu().numpy() # (B,)
+            # is_accepted = is_accepted.cpu().numpy() # (B,)
             p_val = p_val.cpu().numpy() # (B,)
             g_id = g.to(torch.float32).cpu().numpy() # (B,)
             energy = E.to(torch.float32).cpu().numpy() # (B,)
@@ -291,8 +290,8 @@ class Evaluator:
                     "g_id": Array(g_id, dtype=np.float32),
                     "energy": Array(energy, dtype=np.float32),
 
+                    "logits": Array(logits.cpu().numpy(), dtype=np.float32), # (B,)
                     "cut": Array(cut, dtype=np.float32),
-                    "is_accepted": Array(is_accepted, dtype=np.float32),
                     "p_val": Array(p_val, dtype=np.float32),
 
                     "null_calibration_logits": Array(null_logits.cpu().numpy()), # (B, N_rc_cal_data)
@@ -312,9 +311,15 @@ class Evaluator:
 
     def evaluate(self):
         for fid in range(self.config.num_folds):
+            self.load_ensemble(fid)
+            self.cache_null_anchors()
             self.evaluate_fold(fid)
 
-def evaluate(experiment: str, model_name: str, version: str, period: str, working_dir: str, data_dir: str, training_config: str):
+            self.null_anchor_buffer = None
+            # Null held-out dataset
+            self.null_val_anchor_buffer = None
+
+def evaluate(experiment: str, model_name: str, version: str, period: str, working_dir: str, data_dir: str):
     local_rank, rank, world_size, device = _init_torch()
     wd = Path(working_dir)
     mmpd = Path(data_dir)
@@ -334,8 +339,7 @@ def evaluate(experiment: str, model_name: str, version: str, period: str, workin
         experiment=experiment,
         model_name=model_name,
         version=version,
-        mmpd=mmpd,
-        training_config=training_config
+        mmpd=mmpd
     )
 
     config.data_paths = [str(paths.data_dir / f"{key}.npz") for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
@@ -348,7 +352,7 @@ def evaluate(experiment: str, model_name: str, version: str, period: str, workin
     evaluator = Evaluator(
         config=config,
         eval_config=eval_config,
-        model_dir=str(wd / experiment / model_name / version / "checkpoints"),
+        model_dir=str(wd / "trained" / experiment / model_name / version / "checkpoints"),
         save_to=str(wd / "data" / experiment / "tier" / model_name / period / "inferred.lh5"),
         device=device
     )
