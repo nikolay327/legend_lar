@@ -626,7 +626,7 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
 
             indices = indices[:batch_size * (len(indices) // batch_size)] # drop the last incomplete batch
             if last_batch is not None:
-                indices = np.concatenate((indices, last_batch), axis=0)
+                indices = np.concatenate((indices, last_batch), axis=0) # pad the last incomplete batch with nans and append to indices
             indices = indices.reshape(-1, batch_size)
             indices = indices[self.worker_id::self.num_workers]
             current_indices.append(indices)
@@ -650,21 +650,28 @@ class BootstrappedKFoldLArListDataset(IterableDataset):
                 labels.append(partial_label)
                 indices.append(indices_shard)
             
-            if self.hpge_dataset is not None:
-                index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
-                if self.load_both_indices:
+            mode_value = self.mode if isinstance(self.mode, int) else self.mode.value
+            if mode_value in (0, 1):
+                if self.hpge_dataset is not None:
+                    index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
+                    if self.load_both_indices:
+                        batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+                        labels = np.concatenate(labels, axis=0) if len(labels) > 1 else labels[0]
+                    else:
+                        batch = batch[index]
+                        labels = labels[index]
+                    gE = self.hpge_dataset[indices[index]]
+                else:
+                    index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
+                    gE = np.zeros((len(batch[index]), 2), dtype=np.float32)
                     batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
                     labels = np.concatenate(labels, axis=0) if len(labels) > 1 else labels[0]
-                else:
-                    batch = batch[index]
-                    labels = labels[index]
-                gE = self.hpge_dataset[indices[index]]
+                yield batch, gE, labels
             else:
-                index = np.array([0, 1], dtype=np.int64)[self.labels == 0][0]
-                gE = np.zeros((len(batch[index]), 2), dtype=np.float32)
-                batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
-                labels = np.concatenate(labels, axis=0) if len(labels) > 1 else labels[0]
-            yield batch, gE, labels
+                batch = batch[0]
+                indices = indices[0]
+                gE = np.zeros((len(batch), 2), dtype=np.float32) if mode_value != 4 else self.hpge_dataset[indices]
+                return batch, gE, indices
 
 def KFoldBootstrap_worker_init_fn(worker_id: int):
     worker_info = get_worker_info()

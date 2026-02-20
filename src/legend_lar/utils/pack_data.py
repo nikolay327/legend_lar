@@ -61,7 +61,7 @@ def pack_data(x: Tensor, gE: Tensor, zero_token_id: int, return_meta: bool = Fal
     E = gE[b_all, 1] # (N_rep,)
 
     # cu_seqlens and max_seqlen for FlashAttention varlen
-    lengths = torch.bincount(b_all, minlength=B)  # (B,)
+    lengths = torch.bincount(b_all, minlength=B) # (B,)
     cu_seqlens = torch.zeros(B + 1, device=device)
     cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
     max_seqlen = int(lengths.max().item())
