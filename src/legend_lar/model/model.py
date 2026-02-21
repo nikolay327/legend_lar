@@ -1,3 +1,4 @@
+from typing import Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -163,7 +164,7 @@ class UnconditionalRatioEstimator(nn.Module):
 class ConditionalRatioEstimator(nn.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: ModelConfig | BootstrappedKFoldConfig,
         device
     ):
         super(ConditionalRatioEstimator, self).__init__()
@@ -260,7 +261,7 @@ class ConditionalRatioEstimator(nn.Module):
 class ContrastiveRatioEstimator(ConditionalRatioEstimator):
     def __init__(
         self,
-        config: ModelConfig,
+        config: BootstrappedKFoldConfig,
         device
     ):
         super(ContrastiveRatioEstimator, self).__init__(config, device)
@@ -313,7 +314,7 @@ class ContrastiveRatioEstimator(ConditionalRatioEstimator):
         cu_seqlens: Tensor, # (N+1,)
         max_seqlen: int,
         lengths: Tensor # (N,)
-    ):
+    ) -> Tuple[Tensor, Tensor]:
         anchors, e_hpge = self.forward(
             g=g,
             E=E,
@@ -324,7 +325,6 @@ class ContrastiveRatioEstimator(ConditionalRatioEstimator):
             max_seqlen=max_seqlen,
             lengths=lengths
         )
-        # Positives
         pos_logits = (anchors[len(g):] * e_hpge).sum(dim=-1, keepdim=True) / self.config.temperature # (B / 2, 1)
         neg_logits = (anchors[:len(g)] @ e_hpge.t()) / self.config.temperature # (B / 2, B / 2)
         logits = torch.cat([pos_logits, neg_logits], dim=-1) # (B / 2, B / 2 + 1)

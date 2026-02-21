@@ -64,6 +64,10 @@ class BootstrappedKFoldConfig:
     num_folds: int = None
     num_bootstraps_per_fold: int = None
 
+    # NRE-C toggle
+    do_nre_c: int = None
+    gamma: int = None
+
     num_hpges: int = None
     num_sipms: int = None
     num_sipm_t_bins: int = None
