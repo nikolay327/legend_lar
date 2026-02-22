@@ -65,7 +65,6 @@ class BootstrappedKFoldConfig:
     num_bootstraps_per_fold: int = None
 
     # NRE-C toggle
-    do_nre_c: int = None
     gamma: int = None
 
     num_hpges: int = None
@@ -179,3 +178,6 @@ class EvalConfig:
     num_high_pe_in_lar_ft: int = None
 
     alpha: float = None
+    alpha_epistemic: float = None
+
+    global_calib_frac: float = None

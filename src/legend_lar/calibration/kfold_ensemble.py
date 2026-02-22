@@ -48,6 +48,9 @@ class Evaluator:
         self._init_cal_dataloader()
         self._init_phy_dataloader()
 
+        self.phy_4by4: np.ndarray = None
+        self.cal_4by4: np.ndarray = None
+
     def _init_phy_dataloader(self):
         test_folds = [np.load(f'{self.model_dir}/fid_{i}/fold_indices.npy').astype(np.float64).tolist() for i in range(self.config.num_folds)]
         self.phy_dataset = BootstrappedKFoldLArListDataset(
@@ -143,7 +146,8 @@ class Evaluator:
     def _set_null_anchor_buffer(self, mode_id: int):
         self.cal_dataloader.dataset.set_mode(mode_id)
         null_anchor_buffer = []
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, _ in self.cal_dataloader:
+        is_lar_vetoed = []
+        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, indices in self.cal_dataloader:
             g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long)
             E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
             b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
@@ -153,9 +157,13 @@ class Evaluator:
             max_seqlen=int(max_seqlen)
             lengths=lengths.to(device=self.device, non_blocking=True)
 
+            indices = indices.numpy().astype(np.int64)
+            is_lar_vetoed.append(self.cal_4by4[indices])
+
+            anchor_ensemble = []
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 for model in self.ensemble:
-                    anchors, _ = model(
+                    anchors, _ = model(# (B, D)
                         g=g,
                         E=E,
                         b_idx=b_idx,
@@ -165,21 +173,17 @@ class Evaluator:
                         max_seqlen=max_seqlen,
                         lengths=lengths
                     )
-                    # append the last incomplete batch with nans
-                    B = self.config.local_batch_size // 2
-                    if len(anchors) != B:
-                        tail = torch.zeros((B - len(anchors), self.config.hidden_size), dtype=anchors.dtype, device=self.device).fill_(float("nan"))
-                        anchors = torch.cat([anchors, tail])
-                    null_anchor_buffer.append(anchors.reshape(1, -1, self.config.hidden_size)) # (1, B, D)
-        null_anchor_buffer = torch.cat(null_anchor_buffer, dim=0).to(dtype=torch.float32)
-        null_anchor_buffer = null_anchor_buffer.reshape(-1, self.config.num_bootstraps_per_fold, B, self.config.hidden_size) # (-1, n_ensemble, B, D)
-        return null_anchor_buffer
+                    anchor_ensemble.append(anchors.unsqueeze(0))
+            anchor_ensemble = torch.cat(anchor_ensemble, dim=0) # (n_ensemble, B, D) keep in bf16 for storage
+            null_anchor_buffer.append(anchor_ensemble)
+        is_lar_vetoed = np.concatenate(is_lar_vetoed, axis=0)
+        return null_anchor_buffer, is_lar_vetoed
 
     def cache_null_anchors(self):
         # Calibration dataset
-        self.null_anchor_buffer = self._set_null_anchor_buffer(mode_id=2)
+        self.null_anchor_buffer, self.null_is_lar_vetoed = self._set_null_anchor_buffer(mode_id=2)
         # Null held-out dataset
-        self.null_val_anchor_buffer = self._set_null_anchor_buffer(mode_id=3)
+        self.null_val_anchor_buffer, self.null_val_is_lar_vetoed = self._set_null_anchor_buffer(mode_id=3)
 
     def batch_forward(
         self,
@@ -193,7 +197,7 @@ class Evaluator:
         lengths: Tensor
     ):
         e_hpge = []
-        logits = 0.
+        logits = []
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             for model in self.ensemble:
                 anchors, e_hpge_ = model(
@@ -206,23 +210,26 @@ class Evaluator:
                     max_seqlen=max_seqlen,
                     lengths=lengths
                 )
-                logits += (anchors.to(dtype=torch.float32) * e_hpge_.to(dtype=torch.float32)).sum(dim=-1, keepdim=False) / self.config.temperature # (B, )
-                # append the last incomplete batch with nans
-                if len(e_hpge_) != self.config.local_batch_size / 2:
-                    tail = torch.zeros((self.config.local_batch_size // 2 - len(e_hpge_), self.config.hidden_size), dtype=e_hpge_.dtype, device=self.device).fill_(float("nan"))
-                    e_hpge_ = torch.cat([e_hpge_, tail])
+                logits.append(((anchors.to(dtype=torch.float32) * e_hpge_.to(dtype=torch.float32)).sum(dim=-1, keepdim=False) / self.config.temperature).unsqueeze(0)) # (B, )
                 e_hpge.append(e_hpge_.reshape(1, -1, self.config.hidden_size)) # (1, B, D)
         e_hpge = torch.cat(e_hpge, dim=0).to(dtype=torch.float32) # (n_ensemble, B, D)
-        logits = (logits / self.config.num_bootstraps_per_fold).to(dtype=torch.float32) # (B,)
 
-        return logits, e_hpge
+        logits = torch.cat(logits, dim=0) # (n_ensemble, B)
+        # Arithmetic mean
+        delta = torch.logsumexp(logits, dim=0) - math.log(self.config.num_bootstraps_per_fold) # (B,)
+        # Geometric mean
+        logits = (logits / self.config.num_bootstraps_per_fold).to(dtype=torch.float32) # (B,)
+        # Epistemic test statistic
+        delta = delta - logits
+
+        return delta, logits, e_hpge
 
     @torch.no_grad()
     def evaluate_fold(self, fid: int):
         self.phy_dataloader.dataset.set_fold_id(fid)
         for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, indices in self.phy_dataloader:
-            indices = indices.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            logits, e_hpge = self.batch_forward(# (B,), (n_ensemble, B, D)
+            # Calculate the test statistic of each event
+            delta, logits, e_hpge = self.batch_forward(# (B,), (n_ensemble, B, D), # (B,)
                 g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
@@ -236,69 +243,143 @@ class Evaluator:
             # Calculate the test statistic under the null for each event
             null_logits = []
             for anchor in self.null_anchor_buffer:
-                null_logits_ = e_hpge.unsqueeze(2) * anchor.unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
+                null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
                 null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
                 null_logits.append(null_logits_)
-            null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-            null_logits = torch.nansum(null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-            keep = ~torch.isnan(e_hpge[0]).all(dim=-1)
-            null_logits = null_logits[keep]
+            null_logits_ = None
 
-            bias_estimator = torch.logsumexp(null_logits, dim=-1) # (B,) an estimator to the infoNCE bias term
+            null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
+            null_delta = torch.logsumexp(null_logits, dim=0) - math.log(self.config.num_bootstraps_per_fold) # (B, N_rc_data)
+            null_logits = torch.sum(null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
+            null_delta = null_delta - null_logits
 
             # Calculate the test statistic under the heldout null for each event
             heldout_null_logits = []
             for anchor in self.null_val_anchor_buffer:
-                null_logits_ = e_hpge.unsqueeze(2) * anchor.unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
+                null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
                 null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
                 heldout_null_logits.append(null_logits_)
+            null_logits_ = None
+
             heldout_null_logits = torch.cat(heldout_null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-            heldout_null_logits = torch.nansum(heldout_null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-            heldout_null_logits = heldout_null_logits[keep]
+            heldout_null_delta = torch.logsumexp(heldout_null_logits, dim=0) - math.log(self.config.num_bootstraps_per_fold) # (B, N_rc_data)
+            heldout_null_logits = torch.sum(heldout_null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
+            heldout_null_delta = heldout_null_delta - heldout_null_logits
 
-            # Calculate the cut value
-            cut = torch.quantile(null_logits, self.eval_config.alpha, dim=-1) # (B,)
-            # is_accepted = (logits <= cut).to(torch.float32)
-            # Calculate calibrated p-value
+            # Calculate the cut value (for plots)
+            cut = torch.quantile(null_logits, self.eval_config.alpha, dim=-1).cpu().numpy() # (B,)
+
             N_rc_data = null_logits.shape[1]
-            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,), # (B, N_rc_data)
+            # Evidence p-value
+            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
+            p_val = p_val.cpu().numpy()
+            # Epistemic p-value
+            p_val_ep = ((delta >= null_delta.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
+            p_val_ep = p_val_ep.cpu().numpy()
 
-            # Calculate the calibrated p-val under the heldout null (do it in batches)
+            # Calculate the calibrated evidence and epistemic p-val under the heldout null (do it in batches)
             sorted_null = null_logits.sort(dim=-1).values # (B, N_rc_data)
+            null_logits = null_logits.cpu().numpy() # want to release 
+
+            sorted_null_delta = null_delta.sort(dim=-1).values # (B, N_rc_data)
+            null_delta = null_delta.cpu().numpy()
+
             heldout_null_logits_len = heldout_null_logits.shape[1]
             num_iters = math.ceil(heldout_null_logits_len / self.config.local_batch_size)
+    
             null_p_val = []
+            null_p_val_ep = []
             for it in range(num_iters):
                 # (B, local_batch_size)
                 heldout_batch = heldout_null_logits[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_logits_len else heldout_null_logits[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
-                idx = torch.searchsorted(sorted_null, heldout_batch, right=False)  # (B, lb)
+                idx = torch.searchsorted(sorted_null, heldout_batch, right=False) # (B, lb)
                 null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
                 null_p_val.append(null_p_val_)
-            null_p_val = torch.cat(null_p_val, dim=-1) # (B, heldout_null_logits_len)
 
-            cut = cut.cpu().numpy() # (B,)
-            # is_accepted = is_accepted.cpu().numpy() # (B,)
-            p_val = p_val.cpu().numpy() # (B,)
+                heldout_batch = heldout_null_delta[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_logits_len else heldout_null_delta[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
+                idx = torch.searchsorted(sorted_null_delta, heldout_batch, right=False) # (B, lb)
+                null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
+                null_p_val_ep.append(null_p_val_)
+
+            null_p_val_ = None
+            idx = None
+
+            null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
+            null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
+
             g_id = g.to(torch.float32).cpu().numpy() # (B,)
             energy = E.to(torch.float32).cpu().numpy() # (B,)
+
+            # Global score calculation
+            indices = indices.numpy().astype(np.int64)
+            is_lar_vetoed = self.phy_4by4[indices]
+            flag_4by4 = (p_val_ep <= self.eval_config.alpha_epistemic) & is_lar_vetoed
+            global_score = np.copy(p_val)
+            global_score[flag_4by4] = 0. # always reject untrustworthy scores that do not pass the 4x4 classifier
+
+            # Split the heldout null dataset into global calibration dataset and validation
+            N_heldout_null = null_p_val.shape[1]
+            N_heldout_null_cal = math.ceil(self.eval_config.global_calib_frac * N_heldout_null)
+            N_heldout_null_val = N_heldout_null - N_heldout_null_cal
+
+            null_p_val_cal = null_p_val[:, :N_heldout_null_cal]
+            null_p_val = null_p_val[:, N_heldout_null_cal:]
+
+            null_p_val_ep_cal = null_p_val_ep[:, :N_heldout_null_cal]
+            null_p_val_ep = null_p_val_ep[:, N_heldout_null_cal:]
+
+            # Calculate the null global score
+            flag_4by4 = (null_p_val_ep_cal <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[:N_heldout_null_cal]
+            null_global_score = np.copy(null_p_val_cal)
+            null_global_score[flag_4by4] = 0.
+
+            # Calculate the heldout null global score
+            flag_4by4 = (null_p_val_ep <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[N_heldout_null_cal:]
+            heldout_null_global_score = np.copy(null_p_val)
+            heldout_null_global_score[flag_4by4] = 0.
+
+            # Global p-value
+            p_val_glob = ((null_global_score >= global_score.reshape(-1, 1)).sum(dim=-1) + 1) / (N_heldout_null_cal + 1) # (B,)
+
+            # Global p-value under the held-out null
+            sorted_null = torch.tensor(heldout_null_global_score).sort(dim=-1).values
+            heldout_null_len = heldout_null_global_score.shape[1]
+            num_iters = math.ceil(heldout_null_len / self.config.local_batch_size)
+            heldout_null_p_val_glob = []
+            for it in range(num_iters):
+                heldout_batch = heldout_null_global_score[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_len else heldout_null_global_score[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
+                heldout_batch = torch.tensor(heldout_batch)
+                idx = torch.searchsorted(sorted_null, heldout_batch, right=False) # (B, lb)
+                null_p_val_ = ((N_heldout_null_cal - idx).float() + 1) / (N_heldout_null_cal + 1)
+                heldout_null_p_val_glob.append(null_p_val_.numpy())
+            heldout_null_p_val_glob = np.concatenate(heldout_null_p_val_glob, axis=-1)
 
             table_size = len(energy)
             lgdo_table = Table(
                 size=table_size,
                 col_dict={
-                    "evt_idx": Array(indices.view(-1).cpu().numpy()),
+                    "evt_idx": Array(indices.astype(np.float32)),
                     "g_id": Array(g_id, dtype=np.float32),
                     "energy": Array(energy, dtype=np.float32),
+                    "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
 
-                    "logits": Array(logits.cpu().numpy(), dtype=np.float32), # (B,)
+                    "t_epistemic": Array(delta.cpu().numpy(), dtype=np.float32),
+                    "t_evidence": Array(logits.cpu().numpy(), dtype=np.float32),
                     "cut": Array(cut, dtype=np.float32),
-                    "p_val": Array(p_val, dtype=np.float32),
 
-                    "null_calibration_logits": Array(null_logits.cpu().numpy()), # (B, N_rc_cal_data)
-                    "heldout_null_logits": Array(heldout_null_logits.cpu().numpy()), # (B, N_rc_test_data)
-                    "heldout_null_p_val": Array(null_p_val.cpu().numpy()), # (B, N_rc_test_data)
+                    "p_evidence": Array(p_val, dtype=np.float32),
+                    "p_epistemic": Array(p_val_ep, dtype=np.float32),
+                    "p_global": Array(p_val_glob, dtype=np.float32),
 
-                    "logits_bias_estim": Array(bias_estimator.cpu().numpy())
+                    "null_t_epistemic": Array(null_delta, dtype=np.float32),
+                    "null_t_evidence": Array(null_logits, dtype=np.float32),
+
+                    "heldout_null_p_evidence_cal": Array(null_p_val_cal, dtype=np.float32),
+                    "heldout_null_p_epistemic_cal": Array(null_p_val_ep_cal, dtype=np.float32),
+
+                    "heldout_null_p_evidence_test": Array(null_p_val, dtype=np.float32),
+                    "heldout_null_p_epistemic_test": Array(null_p_val_ep, dtype=np.float32),
+                    "heldout_null_p_global_test": Array(heldout_null_p_val_glob, dtype=np.float32)
                 }
             )
             lh5.write(
@@ -308,6 +389,8 @@ class Evaluator:
                 n_rows=table_size,
                 wo_mode="append"
             )
+        self.null_anchor_buffer = None
+        self.null_val_anchor_buffer = None
 
     def evaluate(self):
         for fid in range(self.config.num_folds):
