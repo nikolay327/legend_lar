@@ -181,3 +181,6 @@ class EvalConfig:
     alpha_epistemic: float = None
 
     global_calib_frac: float = None
+
+    phy_4by4_data: str = None
+    fc_4by4_data: str = None
