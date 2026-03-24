@@ -11,6 +11,9 @@ import json
 @dataclass
 class ModelConfig:
     num_hpges: int = None
+    num_hpge_features: int = None
+    attn_num_hpge_emb_layers: int = None
+    global_partitioning_size: int = None
     num_sipms: int = None
     num_sipm_t_bins: int = None
 
