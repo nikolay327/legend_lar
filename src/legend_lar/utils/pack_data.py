@@ -75,21 +75,17 @@ def pack_data(x: Tensor, gE: Tensor, zero_token_id: int, return_meta: bool = Fal
         return g, E, b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths
 
 @torch.no_grad()
-def pack_nrec_data(x: Tensor, zero_token_id: int, return_meta: bool = False):
+def pack_nrec_data(x: Tensor, cls_placeholder_id: int, return_meta: bool = False):
     """
     x: (B, T, S) int counts
         T-dimesion stores the time information, and the S-dimension stores the sipm id information.
         Each entry in x[b] is an integer count of hits in sipm s at time t.
-    zero_token_id: token id in the sipm codebook assigned for a zero-pe event
+    cls_placeholder_id: placeholder id used in the packed s_idx tensor for the CLS token
     """
     
     assert x.dim() == 3, f"Expected x to be (B, T, S), got {tuple(x.shape)}"
     B, T, S = x.shape
     device = x.device
-
-    # Detect zero-pe events
-    has_any = (x > 0).any(dim=(1, 2)) # (B,)
-    empty_b = (~has_any).nonzero(as_tuple=False).squeeze(1) # (E,)
 
     # Indices of nonzero entries (b,t,k) where count > 0
     nz = (x > 0).nonzero(as_tuple=False) # (M, 3)
@@ -104,33 +100,33 @@ def pack_nrec_data(x: Tensor, zero_token_id: int, return_meta: bool = False):
     else: # no nonzeros anywhere
         b_rep = t_rep = k_rep = torch.empty((0,), device=device, dtype=torch.long)
 
-    # Concatenate zero-pe events to the sequence. Assign t = 0 by default for these events
-    if empty_b.numel() > 0:
-        b_z = empty_b.to(dtype=torch.long)
-        t_z = torch.zeros_like(b_z) # choose t = 0
-        k_z = torch.full_like(b_z, fill_value=zero_token_id) # zero-pe token id
+    # Add one CLS placeholder token to every batch entry
+    b_cls = torch.arange(B, device=device, dtype=torch.long) # (B,)
+    t_cls = torch.zeros_like(b_cls) # placeholder only
+    k_cls = torch.full_like(b_cls, fill_value=cls_placeholder_id) # (B,)
 
-        b_all = torch.cat([b_rep, b_z], dim=0)
-        t_all = torch.cat([t_rep, t_z], dim=0)
-        k_all = torch.cat([k_rep, k_z], dim=0)
-    else:
-        b_all, t_all, k_all = b_rep, t_rep, k_rep
-    # b_all, t_all, k_all now contains the b, t, k indices of sipm hits within a batch
+    b_all = torch.cat([b_rep, b_cls], dim=0)
+    t_all = torch.cat([t_rep, t_cls], dim=0)
+    k_all = torch.cat([k_rep, k_cls], dim=0)
+    # b_all, t_all, k_all now contains the b, t, k indices of sipm hits + CLS token placeholder
 
     if b_all.numel() == 0:
         raise RuntimeError("No tokens produced (unexpected).")
-
-    # Sort by (b, t, k) so tokens per batch are contiguous and time-ordered
-    key = (b_all * T + t_all) * S + k_all
+    
+    # Sort by (b, is_not_cls, t, k) so CLS is first within each batch entry, and the remaining tokens are time-ordered.
+    is_not_cls = (k_all != cls_placeholder_id).to(torch.long)
+    k_sort = torch.where(is_not_cls.bool(), k_all, torch.zeros_like(k_all))
+    key = (((b_all * 2 + is_not_cls) * (T + 1) + t_all) * S + k_sort)
     order = torch.argsort(key)
+
     b_all = b_all[order]
     t_all = t_all[order]
     k_all = k_all[order]
-    # (b_all, t_all, k_all) now contains the absolute (b, t, k) indices of unique 1 pe hits, ordered contigiously
+    # (b_all, t_all, k_all) now contains the absolute (b, t, k) indices of unique 1 pe hits, with CLS first in every packed sequence
 
     # cu_seqlens and max_seqlen for FlashAttention varlen
-    lengths = torch.bincount(b_all, minlength=B) # (B,)
-    cu_seqlens = torch.zeros(B + 1, device=device)
+    lengths = torch.bincount(b_all, minlength=B)  # (B,)
+    cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.long)
     cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
     max_seqlen = int(lengths.max().item())
 

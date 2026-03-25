@@ -1,3 +1,5 @@
+import math
+from numpy import angle
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -59,86 +61,172 @@ class JointHPGeEmbedder(nn.Module):
         e = self.joint_emb(e)
         return e
 
-class ParallelContinuousEmbedder:
+class FourierScalarEmbedding(nn.Module):
     def __init__(
         self,
-        num_features: int,
-        emb_dim: int
+        num_bands: int = 16,
+        max_freq_log2: float = 8.0,
+        include_raw: bool = True,
+        base_freq: float = math.pi,
+        dtype: torch.dtype = torch.float32
     ):
-        self.weight = nn.Parameter(
-            torch.empty((num_features, emb_dim, 1))
-        )
-        self.bias = nn.Parameter(torch.empty(num_features, emb_dim))
+        super(FourierScalarEmbedding, self).__init__()
 
+        self.num_bands = int(num_bands)
+        self.max_freq_log2 = float(max_freq_log2)
+        self.include_raw = bool(include_raw)
+        self.base_freq = float(base_freq)
+
+        exponents = torch.linspace(0.0, self.max_freq_log2, steps=self.num_bands, dtype=dtype)
+        freqs = self.base_freq * torch.pow(2.0, exponents) # (num_bands,)
+
+        self.register_buffer("freqs", freqs, persistent=True)
+    
+    @property
+    def out_dim(self) -> int:
+        return (1 if self.include_raw else 0) + 2 * self.num_bands
+    
     def forward(self, x: Tensor) -> Tensor:
-        """
-            x: (B, num_features, 1, 1)
-            return: (B, num_features, D)
-        """
-        return torch.matmul(self.weight, x).squeeze(-1) + self.bias
+        if x.ndim == 0:
+            x = x.unsqueeze(0)
+        if x.shape[-1] == 1:
+            x = x.squeeze(-1)
 
+        angles = x.unsqueeze(-1) * self.freqs
+        parts = []
+        if self.include_raw:
+            parts.append(x.unsqueeze(-1))
+        parts.append(torch.sin(angles))
+        parts.append(torch.cos(angles))
 
-class HPGewithPSD(nn.Module):
+        return torch.cat(parts, dim=-1).contiguous()
+
+class ContinuousFourierTokenizer(nn.Module):
     def __init__(
         self,
+        n_cont: int,
         emb_dim: int,
-        hpge_codebook_size: int,
-        global_partitioning_size: int,
-        hidden_dim: int,
-        num_of_features: int,
-        num_attn_heads: int,
-        num_layers: int
+        mlp_hidden_dim: int,
+        num_bands: int = 16,
+        max_freq_log2: float = 8.0,
+        include_raw: bool = True,
+        base_freq: float = math.pi,
+        dtype: torch.dtype = torch.float32
     ):
-        super(HPGewithPSD, self).__init__()
-        self.num_of_features = num_of_features
-        self.hpge_emb = DiscreteEmbedder(
-            codebook_size=hpge_codebook_size,
-            emb_dim=emb_dim
-        )
-        self.partitioning_emb = DiscreteEmbedder(
-            codebook_size=global_partitioning_size,
-            emb_dim=emb_dim
+        super(ContinuousFourierTokenizer, self).__init__()
+        
+        self.n_cont = int(n_cont)
+        self.emb_dim = int(emb_dim)
+
+        self.scalar_emb = FourierScalarEmbedding(
+            num_bands=num_bands,
+            max_freq_log2=max_freq_log2,
+            include_raw=include_raw,
+            base_freq=base_freq,
+            dtype=dtype
         )
 
-        self.features_emb = ParallelContinuousEmbedder(
-            num_features=num_of_features,
-            emb_dim=emb_dim
+        self.proj = nn.Sequential(
+            nn.Linear(self.scalar_emb.out_dim, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, emb_dim)
         )
-        self.cls_token = nn.Parameter(torch.empty(1, 1, emb_dim))
 
-        self.norm_in = nn.LayerNorm(emb_dim)
-        self.mixer = nn.ModuleList([
-            UnconditionalBlock(
-                emb_dim=emb_dim,
-                mixer_cls=_create_mha_cls(num_attention_heads=num_attn_heads, causal=False),
-                mlp_cls=_create_mlp_cls(intermediate_size=hidden_dim),
-                resid_dropout1=0.,
-                resid_dropout2=0.
-            ) for _ in range(num_layers)
-        ])
-        self.norm_out = nn.LayerNorm(emb_dim)
-
-    def forward(self, gid: Tensor, pid: Tensor, features: Tensor):
+        self.var_id_emb = nn.Parameter(torch.randn(self.n_cont, emb_dim, dtype=dtype))
+    
+    def forward(self, x: Tensor):
         """
-            gid: (B,)
-            features: (B, num_of_features, 1)
+            x: (B, n_cont)
+            return: (B, n_cont, D)
         """
-        e_gid = self.hpge_emb(gid).unsqueeze(1) # (B, 1, D)
-        e_pid = self.partitioning_emb(pid).unsqueeze(1) # (B, 1, D)
+        tokens = self.scalar_emb(x)
+        tokens = self.proj(tokens) # (B, n_cont, D)
+        tokens = tokens + self.var_id_emb
+        return tokens # (B, n_cont, D)
 
-        features = features.reshape(-1, self.num_of_features, 1, 1)
-        e_feat = self.features_emb(features) # (B, num_of_features, D)
+class DetectorTokenizer(nn.Module):
+    def __init__(
+        self,
+        coords: Tensor,
+        emb_dim: int,
+        mlp_hidden_dim: int,
+        num_rz_bands: int = 4,
+        max_freq_log2_rz: float = 4.0,
+        num_phi_harmonics: int = 4,
+        base_freq: float = math.pi,
+        dtype: torch.dtype = torch.float32
+    ):
+        super(DetectorTokenizer, self).__init__()
 
-        emb = torch.cat((self.cls_token, e_gid, e_pid, e_feat), dim=1) # (B, num_of_features+3, D)
-        emb = self.norm_in(emb)
-        residual = None
-        for block in self.mixer:
-            emb, residual = block(
-                hidden_states=emb,
-                residual=residual,
-                cu_seqlens=None,
-                max_seqlen=None
-            )
+        self.num_detectors = int(coords.shape[0])
+        self.emb_dim = int(emb_dim)
+        self.num_rz_bands = int(num_rz_bands)
+        self.num_phi_harmonics = int(num_phi_harmonics)
+        self.max_freq_log2_rz = float(max_freq_log2_rz)
+        self.base_freq = float(base_freq)
 
-        emb = self.norm_out(emb[:, 0, :] + residual[:, 0, :])
-        return emb
+        coords = coords.to(dtype)
+        self.register_buffer("coords", coords, persistent=True)
+
+        exponents = torch.linspace(0.0, self.max_freq_log2_rz, steps=self.num_rz_bands, dtype=dtype)
+        freqs_rz = self.base_freq * torch.pow(2.0, exponents) # (num_rz_bands,)
+        self.register_buffer("freqs_rz", freqs_rz, persistent=True)
+
+        geom_features = self._build_geometry_features(coords, freqs_rz)
+        self.register_buffer("geom_features", geom_features, persistent=True)
+
+        self.proj = nn.Sequential(
+            nn.Linear(self.geom_features.shape[1], mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, emb_dim)
+        )
+
+        self.det_id_emb = nn.Embedding(self.num_detectors, emb_dim)
+
+    @torch.no_grad()
+    def _build_geometry_features(
+        self,
+        coords: Tensor,
+        freqs_rz: Tensor
+    ) -> Tensor:
+        r = coords[:, 0]
+        phi = coords[:, 1]
+        z = coords[:, 2]
+
+        parts = [
+            r.unsqueeze(-1),
+            z.unsqueeze(-1)
+        ]
+
+        m = torch.arange(
+            1, self.num_phi_harmonics + 1,
+            dtype=coords.dtype,
+            device=coords.device
+        )
+        angles = phi.unsqueeze(-1) * m.unsqueeze(0)
+        parts.append(torch.sin(angles))
+        parts.append(torch.cos(angles))
+
+        r_angles = r.unsqueeze(-1) * freqs_rz.unsqueeze(0)
+        z_angles = z.unsqueeze(-1) * freqs_rz.unsqueeze(0)
+
+        parts.append(torch.sin(r_angles))
+        parts.append(torch.cos(r_angles))
+        parts.append(torch.sin(z_angles))
+        parts.append(torch.cos(z_angles))
+
+        return torch.cat(parts, dim=-1)
+
+    @property
+    def geom_feature_dim(self) -> int:
+        return int(self.geom_features.shape[1])
+    
+    def forward(self, x: Tensor):
+        if x.dtype != torch.long:
+            x = x.to(dtype=torch.long)
+
+        tokens = self.geom_features[x]
+        tokens = self.proj(tokens)
+        tokens = tokens + self.det_id_emb(x)
+
+        return tokens # (B, D)

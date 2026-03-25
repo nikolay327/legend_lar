@@ -107,6 +107,68 @@ class BootstrappedKFoldConfig:
 
     save_to: str = None
 
+@dataclass
+class NRECConfig:
+    rng_seed: int = None
+    rel_tolerance: float = None
+    patience: int = None
+    max_epochs: int = None
+
+    num_folds: int = None
+    num_bootstraps_per_fold: int = None
+
+    # NRE-C toggle
+    gamma: int = None
+    temperature: float = None
+
+    # Transformer general config
+    hidden_size: int = None
+    intermediate_size: int = None
+    num_attention_heads: int = None
+    block_resid_dropout1: float = None
+    block_resid_dropout2: float = None
+    causal: int = None
+
+    # LAr encoder
+    num_sipms: int = None
+    num_sipm_t_bins: int = None
+    sipm_num_rz_bands: int = None
+    sipm_max_freq_log2_rz: float = None
+    sipm_num_phi_harmonics: int = None
+    sipm_cls_placeholder_id: int = None
+
+    sipm_num_layers: int = None
+
+    # HPGe encoder
+    hpge_global_partitioning_size: int = None
+
+    num_hpges: int = None
+    hpge_num_rz_bands: int = None
+    hpge_max_freq_log2_rz: float = None
+    hpge_num_phi_harmonics: int = None
+
+    hpge_num_features: int = None
+    hpge_num_feat_bands: int = None
+    hpge_feat_max_freq_log2: float = None
+
+    hpge_num_layers: int = None
+
+    hpge_id_and_energy: str = None
+    data_paths: list[str] = None
+    prior: list[float] = None
+    labels: list[int] = None
+
+    # Training hyperparams
+    local_batch_size: int = None
+    sg_train_val_cal_test_frac: list[float] = None
+    times_of_mixing: int = None
+
+    lr_model: float = None
+    betas_model: Tuple[float, float] = None
+    weight_decay: float = None
+
+    save_to: str = None
+
 @dataclass(frozen=True)
 class Paths:
     root: Path # working dir
