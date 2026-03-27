@@ -998,13 +998,13 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                 batch.append(partial_batch.toarray().reshape(-1, self.num_t_bins, self.num_sipm_chs))
                 indices.append(indices_shard)
 
-        batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
-        if mode_value in (0, 1):
-            gE = self.hpge_dataset[indices[1]]
-        else:
-            if self.hpge_dataset is not None:
-                gE = self.hpge_dataset[indices[0]]
+            batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
+            if mode_value in (0, 1):
+                gE = self.hpge_dataset[indices[1]]
             else:
-                gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 2), dtype=np.float32)
-        indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
-        yield batch, gE, indices
+                if self.hpge_dataset is not None:
+                    gE = self.hpge_dataset[indices[0]]
+                else:
+                    gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 2), dtype=np.float32)
+            indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
+            yield batch, gE, indices

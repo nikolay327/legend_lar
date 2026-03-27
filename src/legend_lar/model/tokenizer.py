@@ -1,12 +1,7 @@
 import math
-from numpy import angle
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
-
-from legend_lar.model.cls import _create_mha_cls, _create_mlp_cls
-from legend_lar.model.block import UnconditionalBlock
 
 class DiscreteEmbedder(nn.Module):
     def __init__(self, codebook_size: int, emb_dim: int):
@@ -104,7 +99,6 @@ class FourierScalarEmbedding(nn.Module):
 class ContinuousFourierTokenizer(nn.Module):
     def __init__(
         self,
-        n_cont: int,
         emb_dim: int,
         mlp_hidden_dim: int,
         num_bands: int = 16,
@@ -115,7 +109,6 @@ class ContinuousFourierTokenizer(nn.Module):
     ):
         super(ContinuousFourierTokenizer, self).__init__()
         
-        self.n_cont = int(n_cont)
         self.emb_dim = int(emb_dim)
 
         self.scalar_emb = FourierScalarEmbedding(
@@ -131,18 +124,15 @@ class ContinuousFourierTokenizer(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, emb_dim)
         )
-
-        self.var_id_emb = nn.Parameter(torch.randn(self.n_cont, emb_dim, dtype=dtype))
     
     def forward(self, x: Tensor):
         """
-            x: (B, n_cont)
-            return: (B, n_cont, D)
+            x: (B, )
+            return: (B, D)
         """
         tokens = self.scalar_emb(x)
-        tokens = self.proj(tokens) # (B, n_cont, D)
-        tokens = tokens + self.var_id_emb
-        return tokens # (B, n_cont, D)
+        tokens = self.proj(tokens) # (B, D)
+        return tokens # (B, D)
 
 class DetectorTokenizer(nn.Module):
     def __init__(

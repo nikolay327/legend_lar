@@ -1,23 +1,22 @@
 import torch, math
 import torch.nn as nn
 
-from legend_lar.model.tokenizer import ParallelContinuousEmbedder
-
 class InitRNG:
-    def __init__(self, seed: int, device: str | None = None):
-        self.g = torch.Generator(device=device if device is not None else "cpu")
-        self.g.manual_seed(seed)
+    def __init__(self, device: str | None = None):
+        self.device = device
 
     @torch.no_grad()
-    def reinit_(self, model: nn.Module):
+    def reinit_(self, model: nn.Module, seed: int):
+        rng = torch.Generator(device=self.device if self.device is not None else "cpu")
+        rng.manual_seed(seed)
+
         handled_modules = (
             nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
             nn.Embedding,
-            nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
-            ParallelContinuousEmbedder
+            nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d
         )
         for m in model.modules():
-            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, ParallelContinuousEmbedder)):
+            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5), generator=self.g)
                 if m.bias is not None:
                     fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)

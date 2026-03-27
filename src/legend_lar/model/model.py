@@ -353,15 +353,16 @@ class NREC(nn.Module):
             config=config,
             device=device
         )
-    
+
     def forward(
         self,
-        gid: Tensor, # (B/2,)
-        pid: Tensor, # (B/2,)
-        hpge_feats: Tensor, # (B/2, N_feats)
+        f_idx: Tensor, # (N_valid,)
+        f_vals: Tensor, # (N_valid,)
+        ge_cu_seqlens: Tensor, # (B/2+1,)
+        ge_max_seqlen: int,
         t_idx: Tensor, # (N,)
         s_idx: Tensor, # (N,)
-        cu_seqlens: Tensor, # (N+1,)
+        cu_seqlens: Tensor, # (B+1,)
         max_seqlen: int
     ):
         e_lar = self.lar_encoder(
@@ -371,6 +372,11 @@ class NREC(nn.Module):
             max_seqlen=max_seqlen
         ) # (B, D)
 
-        e_hpge = self.hpge_encoder(gid, pid, hpge_feats) # (B / 2, D)
+        e_hpge = self.hpge_encoder(
+            f_idx=f_idx,
+            f_vals=f_vals,
+            cu_seqlens=ge_cu_seqlens,
+            max_seqlen=ge_max_seqlen
+        ) # (B/2, D)
 
         return e_lar, e_hpge

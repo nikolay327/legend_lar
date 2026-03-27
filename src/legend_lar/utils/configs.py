@@ -150,6 +150,7 @@ class NRECConfig:
     hpge_num_features: int = None
     hpge_num_feat_bands: int = None
     hpge_feat_max_freq_log2: float = None
+    hpge_cls_placeholder_id: int = None
 
     hpge_num_layers: int = None
 
