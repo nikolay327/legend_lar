@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from legend_lar.utils import NRECConfig
-from legend_lar.model.cls import create_unconditional_block
+from legend_lar.model.cls import create_block
 from legend_lar.model.tokenizer import DetectorTokenizer, ContinuousFourierTokenizer
 from legend_lar.model.pos_embedding import SinPositionalEmbedding
 
@@ -38,7 +38,7 @@ class LArEncoder(nn.Module):
         self.cls_token = nn.Parameter(torch.empty(self.config.hidden_size))
 
         self.blocks = nn.ModuleList([
-            create_unconditional_block(self.config) for _ in range(self.config.sipm_num_layers)
+            create_block(self.config) for _ in range(self.config.sipm_num_layers)
         ])
 
         self.norm = nn.LayerNorm(self.config.hidden_size)
@@ -123,7 +123,7 @@ class HPGeEncoder(nn.Module):
         self.cls_token = nn.Parameter(torch.empty(self.config.hidden_size))
 
         self.blocks = nn.ModuleList([
-            create_unconditional_block(self.config) for _ in range(self.config.hpge_num_layers)
+            create_block(self.config) for _ in range(self.config.hpge_num_layers)
         ])
 
         self.norm = nn.LayerNorm(self.config.hidden_size)

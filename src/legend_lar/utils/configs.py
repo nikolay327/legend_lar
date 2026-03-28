@@ -9,105 +9,6 @@ from typing import Tuple, Dict
 import json
 
 @dataclass
-class ModelConfig:
-    num_hpges: int = None
-    num_hpge_features: int = None
-    attn_num_hpge_emb_layers: int = None
-    global_partitioning_size: int = None
-    num_sipms: int = None
-    num_sipm_t_bins: int = None
-
-    hidden_size: int = None
-    intermediate_size: int = None
-    num_attention_heads: int = None
-
-    norm_gate_tanh_scale: float = None
-    norm_zero_init: int = None
-    
-    block_resid_dropout1: float = None
-    block_resid_dropout2: float = None
-
-    num_layers: int = None
-    causal: int = None
-
-    temperature: float = None
-    hpge_energy_mean: float = None
-    hpge_energy_std: float = None
-
-    hpge_id_and_energy: str = None
-    data_paths: list[str] = None
-    prior: list[float] = None
-    labels: list[int] = None
-    true_coincidence_label: int = None
-
-    # Training hyperparams
-    local_batch_size: int = None
-    train_val_test_fract: list[float] = None
-    rng_seed_for_split: int = None
-    times_of_mixing: int = None
-    global_rng_seed_for_sampling: int = None
-
-    lr_model: float = None
-    betas_model: Tuple[float, float] = None
-    weight_decay: float = None
-
-    # calibration check
-    ece_bins: int = None
-    n_classes: int = None
-
-    save_to: str = None
-
-@dataclass
-class BootstrappedKFoldConfig:
-    rng_seed: int = None
-    rel_tolerance: float = None
-    patience: int = None
-    max_epochs: int = None
-
-    num_folds: int = None
-    num_bootstraps_per_fold: int = None
-
-    # NRE-C toggle
-    gamma: int = None
-
-    num_hpges: int = None
-    num_sipms: int = None
-    num_sipm_t_bins: int = None
-
-    hidden_size: int = None
-    intermediate_size: int = None
-    num_attention_heads: int = None
-
-    norm_gate_tanh_scale: float = None
-    norm_zero_init: int = None
-    
-    block_resid_dropout1: float = None
-    block_resid_dropout2: float = None
-
-    num_layers: int = None
-    causal: int = None
-
-    temperature: float = None
-    hpge_energy_mean: float = None
-    hpge_energy_std: float = None
-
-    hpge_id_and_energy: str = None
-    data_paths: list[str] = None
-    prior: list[float] = None
-    labels: list[int] = None
-
-    # Training hyperparams
-    local_batch_size: int = None
-    sg_train_val_cal_test_frac: list[float] = None
-    times_of_mixing: int = None
-
-    lr_model: float = None
-    betas_model: Tuple[float, float] = None
-    weight_decay: float = None
-
-    save_to: str = None
-
-@dataclass
 class NRECConfig:
     rng_seed: int = None
     rel_tolerance: float = None
@@ -154,14 +55,15 @@ class NRECConfig:
 
     hpge_num_layers: int = None
 
-    hpge_id_and_energy: str = None
-    data_paths: list[str] = None
-    prior: list[float] = None
-    labels: list[int] = None
+    # Training data
+    lar_paths: list[str] = None
+    hpge_path: str = None
+    hpge_feats_mean: list[float] = None
+    hpge_feats_std: list[float] = None
 
     # Training hyperparams
     local_batch_size: int = None
-    sg_train_val_cal_test_frac: list[float] = None
+    sg_train_val: list[float] = None
     times_of_mixing: int = None
 
     lr_model: float = None
@@ -198,21 +100,21 @@ def load_config(config_json: str, working_dir: Path, data_dir: Path) -> Tuple[Di
     return model_config, data_config, paths
 
 def init_config(paths: Paths, experiment: str, model_name: str, version: str, model_config: dict, config_obj = None):
-    config = ModelConfig() if config_obj is None else config_obj
+    config = NRECConfig() if config_obj is None else config_obj
     config.__dict__.update(model_config)
 
     config.save_to = str(paths.trained / experiment / model_name / version / "checkpoints")
     return config
 
 def _initialize_configs(
-    config_obj: ModelConfig | BootstrappedKFoldConfig,
+    config_obj: NRECConfig,
     wd: Path,
     experiment: str,
     model_name: str,
     version: str,
     mmpd: Path,
     training_config: str = None
-) -> Tuple[ModelConfig | BootstrappedKFoldConfig, dict, Paths]:
+) -> Tuple[NRECConfig, dict, Paths]:
     config_json = wd / "trained" / experiment / model_name / version / f"{model_name}_{version}.json"
     os.makedirs(os.path.dirname(str(config_json)), exist_ok=True)
     if training_config is not None and not config_json.exists():
