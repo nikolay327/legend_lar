@@ -35,3 +35,5 @@ dist/
 env/
 venv/
 
+# legacy codes
+*_legacy.py
