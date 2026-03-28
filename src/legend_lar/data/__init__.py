@@ -1,10 +1,8 @@
-from .dataset import LArListDataset, worker_init_fn, BootstrappedKFoldLArListDataset, KFoldBootstrap_worker_init_fn
-from .collate_fn import CollateFn
+from .dataset import ParallelBootstrappedKFoldLArListDataset, ParallelKFoldBootstrap_worker_init_fn
+from .collate_fn import NRECCollateFn
 
 __all__ = [
-    "LArListDataset",
-    "worker_init_fn",
-    "BootstrappedKFoldLArListDataset",
-    "KFoldBootstrap_worker_init_fn",
-    "CollateFn"
+    "ParallelBootstrappedKFoldLArListDataset",
+    "ParallelKFoldBootstrap_worker_init_fn",
+    "NRECCollateFn"
 ]
