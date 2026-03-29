@@ -2,6 +2,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from legend_lar.utils import NRECConfig
+from legend_lar.model.tokenizer import GeometryTokenizer
 from legend_lar.model.encoder import LArEncoder, HPGeEncoder
 
 
@@ -27,6 +28,14 @@ class NREC(nn.Module):
             device=device
         )
 
+        self.geom_tokenizer = GeometryTokenizer(
+            emb_dim=config.hidden_size,
+            hidded_size=config.intermediate_size,
+            r_dim=self.lar_encoder.geometry_table.r_feature_dim,
+            phi_dim=self.lar_encoder.geometry_table.phi_feature_dim,
+            z_dim=self.lar_encoder.geometry_table.z_feature_dim
+        )
+
     def forward(
         self,
         f_idx: Tensor, # (N_valid,)
@@ -42,14 +51,16 @@ class NREC(nn.Module):
             t_idx=t_idx,
             s_idx=s_idx,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
+            max_seqlen=max_seqlen,
+            geom_tokenizer=self.geom_tokenizer
         ) # (B, D)
 
         e_hpge = self.hpge_encoder(
             f_idx=f_idx,
             f_vals=f_vals,
             cu_seqlens=ge_cu_seqlens,
-            max_seqlen=ge_max_seqlen
+            max_seqlen=ge_max_seqlen,
+            geom_tokenizer=self.geom_tokenizer
         ) # (B/2, D)
 
         return e_lar, e_hpge

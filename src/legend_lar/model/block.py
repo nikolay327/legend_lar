@@ -6,12 +6,10 @@
     Input, weights, and biases are casted to bf16, while layer_norm computations are kept in fp32 for stability.
 """
 
-import math
 from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_varlen_qkvpacked_func

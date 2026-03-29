@@ -31,12 +31,14 @@ class NRECConfig:
     attn_dropout: float = None
     causal: int = None
 
+    # Geometry table general config
+    num_rz_bands: int = None
+    max_freq_log2_rz: float = None
+    num_phi_harmonics: int = None
+
     # LAr encoder
     num_sipms: int = None
     num_sipm_t_bins: int = None
-    sipm_num_rz_bands: int = None
-    sipm_max_freq_log2_rz: float = None
-    sipm_num_phi_harmonics: int = None
     sipm_cls_placeholder_id: int = None
 
     sipm_num_layers: int = None
@@ -45,10 +47,6 @@ class NRECConfig:
     hpge_global_partitioning_size: int = None
 
     num_hpges: int = None
-    hpge_num_rz_bands: int = None
-    hpge_max_freq_log2_rz: float = None
-    hpge_num_phi_harmonics: int = None
-
     hpge_num_features: int = None
     hpge_num_feat_bands: int = None
     hpge_feat_max_freq_log2: float = None
