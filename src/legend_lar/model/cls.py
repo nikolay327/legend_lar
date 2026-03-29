@@ -5,10 +5,11 @@ from legend_lar.model.mlp import MLP
 from legend_lar.model.block import Block
 from legend_lar.utils.configs import NRECConfig
 
-def _create_mha_cls(num_attention_heads: int, causal: bool):
+def _create_mha_cls(num_attention_heads: int, attn_dropout: float, causal: bool):
     return partial(
         MHA,
         num_heads=num_attention_heads,
+        attn_dropout=attn_dropout,
         causal=causal
     )
 
@@ -21,6 +22,7 @@ def _create_mlp_cls(intermediate_size: int):
 def create_block(config: NRECConfig):
     mixer_cls = _create_mha_cls(
         num_attention_heads=config.num_attention_heads,
+        attn_dropout=0.0 if config.attn_dropout is None else config.attn_dropout,
         causal=False if config.causal is None else config.causal==1,
     )
     mlp_cls = _create_mlp_cls(config.intermediate_size)

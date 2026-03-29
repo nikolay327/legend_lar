@@ -8,6 +8,7 @@ class MHA(nn.Module):
         self,
         emb_dim: int,
         num_heads: int,
+        attn_dropout: float = 0.0,
         causal: bool = False
     ):
         super(MHA, self).__init__()
@@ -17,7 +18,7 @@ class MHA(nn.Module):
         self.head_dim = self.emb_dim // self.num_heads
         self.causal = causal
 
-        self.attn = FlashSelfAttention(causal=self.causal)
+        self.attn = FlashSelfAttention(causal=self.causal, attention_dropout=attn_dropout)
         self.Wqkv = nn.Linear(self.emb_dim, 3 * self.emb_dim)
         self.out_proj = nn.Linear(self.emb_dim, self.emb_dim)
 

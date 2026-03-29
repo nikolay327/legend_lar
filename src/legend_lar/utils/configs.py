@@ -28,6 +28,7 @@ class NRECConfig:
     num_attention_heads: int = None
     block_resid_dropout1: float = None
     block_resid_dropout2: float = None
+    attn_dropout: float = None
     causal: int = None
 
     # LAr encoder

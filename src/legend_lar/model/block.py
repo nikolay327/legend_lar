@@ -4,12 +4,10 @@
     See https://github.com/dao-ailab/flash-attention
 
     Input, weights, and biases are casted to bf16, while layer_norm computations are kept in fp32 for stability.
-
-    This implementation is opaque to torch.compile, and thus fully compatible with it.
 """
 
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,674 +16,441 @@ from torch import Tensor
 
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_varlen_qkvpacked_func
 
-def _to_dtype(x: Tensor, dtype: torch.dtype):
-    return x.to(dtype) if x.is_floating_point() and x.dtype != dtype else x
 
-def _bf16_block_func(
+def _to_bf16(x: Tensor) -> Tensor:
+    return x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+
+# Dropout layer customized to add more flexibility later.
+# TODO: add an option for epoch-based and fid-/bid-based seed for mask generation.
+# Generating the mask outside the fwd and bwd (inside the main class body) is an option.
+def _dropout_fwd(x: Tensor, p: float, training: bool) -> tuple[Tensor, Tensor]:
+    if (not training) or p == 0.0:
+        return x, torch.empty(0, device=x.device, dtype=torch.bool)
+    keep = 1.0 - p
+    mask = (torch.rand(x.shape, device=x.device, dtype=torch.float32) < keep)
+    y = x * mask.to(dtype=x.dtype) / keep
+    return y, mask
+
+def _dropout_bwd(grad_y: Tensor, mask: Tensor, p: float, training: bool) -> Tensor:
+    if (not training) or p == 0.0:
+        return grad_y
+    keep = 1.0 - p
+    return grad_y * mask.to(dtype=grad_y.dtype) / keep
+
+# linear
+def _linear_fwd(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    return torch.ops.aten.linear.default(x, weight, bias)
+
+def _linear_bwd(grad_y: Tensor, x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    grad_x, grad_w, grad_b = torch.ops.aten.linear_backward.default(
+        x,
+        grad_y,
+        weight,
+        [True, True, True]
+    )
+    return grad_x, grad_w, grad_b
+
+# gelu
+def _gelu_fwd_tanh(x: Tensor) -> Tensor:
+    return torch.ops.aten.gelu.default(x, "tanh")
+
+def _gelu_bwd_tanh(grad_y: Tensor, x: Tensor) -> Tensor:
+    return torch.ops.aten.gelu_backward.default(grad_y, x, "tanh")
+
+# layer_norm
+def _layernorm_fwd_fp32(
+    x_bf16: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    eps: float,
+):
+    x_fp32 = x_bf16.float()
+    w_fp32 = weight.float()
+    b_fp32 = bias.float()
+
+    y_fp32, mean_fp32, rstd_fp32 = torch.ops.aten.native_layer_norm.default(
+        x_fp32,
+        [x_bf16.shape[-1]],
+        w_fp32,
+        b_fp32,
+        eps
+    )
+    return y_fp32.to(torch.bfloat16), mean_fp32, rstd_fp32
+
+def _layernorm_bwd_fp32(
+    grad_y: Tensor,
+    x_bf16: Tensor,
+    mean_fp32: Tensor,
+    rstd_fp32: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+):
+    grad_x_fp32, grad_w_fp32, grad_b_fp32 = torch.ops.aten.native_layer_norm_backward.default(
+        grad_y.float(),
+        x_bf16.float(),
+        [x_bf16.shape[-1]],
+        mean_fp32,
+        rstd_fp32,
+        weight.float(),
+        bias.float(),
+        [True, True, True]
+    )
+    return grad_x_fp32, grad_w_fp32, grad_b_fp32
+
+@torch.library.custom_op("legendblock::pre_attn_qkv", mutates_args=(), device_types="cuda")
+def pre_attn_qkv(
     hidden_states: Tensor,
     residual: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-
-    # norm_attn
-    norm_attn_weight: Tensor,
-    norm_attn_bias: Tensor,
-
-    # mixer: Wqkv + out_proj
-    Wqkv_weight: Tensor,
-    Wqkv_bias: Tensor,
-    out_proj_weight: Tensor,
-    out_proj_bias: Tensor,
-
-    # norm_mlp
-    norm_mlp_weight: Tensor,
-    norm_mlp_bias: Tensor,
-
-    # mlp: fc1 + fc2
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
-
-    # metadata
-    num_heads: int,
-    head_dim: int,
-    causal: bool,
-
-    attn_dropout_p: float,
-    softmax_scale: float,
-    window_left: int,
-    window_right: int,
-    deterministic: bool,
-
-    resid_dropout1_p: float,
-    resid_dropout2_p: float,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    wqkv_weight: Tensor,
+    wqkv_bias: Tensor,
+    resid_dropout_p: float,
     training: bool,
-
-    norm_attn_eps: float,
-    norm_mlp_eps: float,
-    is_varlen: bool
-
-) -> Tuple[Tensor, Tensor]:
-    block_dtype = torch.bfloat16
-
-    hs = _to_dtype(hidden_states, block_dtype)
-    res = _to_dtype(residual, block_dtype)
-
-    na_w = _to_dtype(norm_attn_weight, block_dtype)
-    na_b = _to_dtype(norm_attn_bias, block_dtype)
-
-    wqkv_w = _to_dtype(Wqkv_weight, block_dtype)
-    wqkv_b = _to_dtype(Wqkv_bias, block_dtype)
-    out_w = _to_dtype(out_proj_weight, block_dtype)
-    out_b = _to_dtype(out_proj_bias, block_dtype)
-
-    nm_w = _to_dtype(norm_mlp_weight, block_dtype)
-    nm_b = _to_dtype(norm_mlp_bias, block_dtype)
-
-    fc1_w = _to_dtype(fc1_weight, block_dtype)
-    fc1_b = _to_dtype(fc1_bias, block_dtype)
-    fc2_w = _to_dtype(fc2_weight, block_dtype)
-    fc2_b = _to_dtype(fc2_bias, block_dtype)
-
-    dropped = F.dropout(hs, p=resid_dropout1_p, training=training)
-    res1 = res + dropped
-
-    # Layernorm in FP32
-    x = F.layer_norm(
-        input=res1.float(),
-        normalized_shape=(res1.shape[-1],),
-        weight=na_w.float(),
-        bias=na_b.float(),
-        eps=norm_attn_eps
-    )
-    x = _to_dtype(x, block_dtype)
-
-    qkv = F.linear(x, wqkv_w, wqkv_b)
-    qkv = qkv.view(*x.shape[:-1], 3, num_heads, head_dim).contiguous()
-
-    attn_p = attn_dropout_p if training else 0.0
-
-    if is_varlen:
-        x = flash_attn_varlen_qkvpacked_func(
-            qkv,
-            cu_seqlens,
-            max_seqlen,
-            attn_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=(window_left, window_right),
-            deterministic=deterministic
-        )
-
-    else:
-        x = flash_attn_qkvpacked_func(
-            qkv,
-            attn_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=(window_left, window_right),
-            deterministic=deterministic
-        )
-    
-    x = x.reshape(*x.shape[:-2], num_heads * head_dim)
-    x = F.linear(x, out_w, out_b)
-
-    res2 = res1 + F.dropout(x, p=resid_dropout2_p, training=training)
-    
-    # Layernorm in FP32
-    x = F.layer_norm(
-        input=res2.float(),
-        normalized_shape=(res2.shape[-1],),
-        weight=nm_w.float(),
-        bias=nm_b.float(),
-        eps=norm_mlp_eps
-    )
-    x = _to_dtype(x, block_dtype)
-
-    x = F.linear(x, fc1_w, fc1_b)
-    x = F.gelu(x, approximate="tanh")
-    out = F.linear(x, fc2_w, fc2_b)
-
-    return out, res2
-
-@torch.library.custom_op("larlib::bf16_block_forward", mutates_args=(), device_types="cuda")
-def bf16_block_forward(
-    hidden_states: Tensor,
-    residual: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-
-    # norm_attn
-    norm_attn_weight: Tensor,
-    norm_attn_bias: Tensor,
-
-    # mixer: Wqkv + out_proj
-    Wqkv_weight: Tensor,
-    Wqkv_bias: Tensor,
-    out_proj_weight: Tensor,
-    out_proj_bias: Tensor,
-
-    # norm_mlp
-    norm_mlp_weight: Tensor,
-    norm_mlp_bias: Tensor,
-
-    # mlp: fc1 + fc2
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
-
-    # metadata
+    norm_eps: float,
     num_heads: int,
-    head_dim: int,
-    causal: bool,
+    head_dim: int
+):
+    hs = _to_bf16(hidden_states)
+    res = _to_bf16(residual)
 
-    attn_dropout_p: float,
-    softmax_scale: float,
-    window_left: int,
-    window_right: int,
-    deterministic: bool,
+    dropped1, mask1 = _dropout_fwd(hs, resid_dropout_p, training)
+    residual1 = res + dropped1
 
-    resid_dropout1_p: float,
-    resid_dropout2_p: float,
-    training: bool,
-
-    norm_attn_eps: float,
-    norm_mlp_eps: float,
-    is_varlen: bool
-) -> Tuple[Tensor, Tensor]:
-    return _bf16_block_func(
-        hidden_states,
-        residual,
-        cu_seqlens,
-        max_seqlen,
-        norm_attn_weight,
-        norm_attn_bias,
-        Wqkv_weight,
-        Wqkv_bias,
-        out_proj_weight,
-        out_proj_bias,
-        norm_mlp_weight,
-        norm_mlp_bias,
-        fc1_weight,
-        fc1_bias,
-        fc2_weight,
-        fc2_bias,
-        num_heads,
-        head_dim,
-        causal,
-        attn_dropout_p,
-        softmax_scale,
-        window_left,
-        window_right,
-        deterministic,
-        resid_dropout1_p,
-        resid_dropout2_p,
-        training,
-        norm_attn_eps,
-        norm_mlp_eps,
-        is_varlen,
+    ln_out, mean, rstd = _layernorm_fwd_fp32(
+        residual1,
+        norm_weight,
+        norm_bias,
+        norm_eps
     )
 
-@bf16_block_forward.register_fake
+    wqkv_weight_bf16 = _to_bf16(wqkv_weight)
+    wqkv_bias_bf16 = _to_bf16(wqkv_bias)
+    qkv_lin = _linear_fwd(ln_out, wqkv_weight_bf16, wqkv_bias_bf16)
+    qkv = qkv_lin.view(*ln_out.shape[:-1], 3, num_heads, head_dim).contiguous()
+
+    return qkv, residual1, mask1, mean, rstd, ln_out
+
+@pre_attn_qkv.register_fake
 def _(
     hidden_states: Tensor,
     residual: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-
-    norm_attn_weight: Tensor,
-    norm_attn_bias: Tensor,
-
-    Wqkv_weight: Tensor,
-    Wqkv_bias: Tensor,
-    out_proj_weight: Tensor,
-    out_proj_bias: Tensor,
-
-    norm_mlp_weight: Tensor,
-    norm_mlp_bias: Tensor,
-
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
-
-    num_heads: int,
-    head_dim: int,
-    causal: bool,
-
-    attn_dropout_p: float,
-    softmax_scale: float,
-    window_left: int,
-    window_right: int,
-    deterministic: bool,
-
-    resid_dropout1_p: float,
-    resid_dropout2_p: float,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    wqkv_weight: Tensor,
+    wqkv_bias: Tensor,
+    resid_dropout_p: float,
     training: bool,
-
-    norm_attn_eps: float,
-    norm_mlp_eps: float,
-    is_varlen: bool
-) -> Tuple[Tensor, Tensor]:
-    out = hidden_states.new_empty(hidden_states.shape, dtype=torch.float32)
-    res = hidden_states.new_empty(hidden_states.shape, dtype=torch.float32)
-    return out, res
-
-@torch.library.custom_op("larlib::bf16_block_backward", mutates_args=(), device_types="cuda")
-def bf16_block_backward(
-    grad_out: Tensor,
-    grad_residual_out: Tensor,
-
-    hidden_states: Tensor,
-    residual: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-
-    norm_attn_weight: Tensor,
-    norm_attn_bias: Tensor,
-
-    Wqkv_weight: Tensor,
-    Wqkv_bias: Tensor,
-    out_proj_weight: Tensor,
-    out_proj_bias: Tensor,
-
-    norm_mlp_weight: Tensor,
-    norm_mlp_bias: Tensor,
-
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
-
+    norm_eps: float,
     num_heads: int,
-    head_dim: int,
-    causal: bool,
-
-    attn_dropout_p: float,
-    softmax_scale: float,
-    window_left: int,
-    window_right: int,
-    deterministic: bool,
-
-    resid_dropout1_p: float,
-    resid_dropout2_p: float,
-    training: bool,
-
-    norm_attn_eps: float,
-    norm_mlp_eps: float,
-    is_varlen: bool
-) -> Tuple[
-    Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-    Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-    Tensor, Tensor
-]:
-    with torch.enable_grad():
-        hs = hidden_states.detach().requires_grad_(hidden_states.requires_grad)
-        res = residual.detach().requires_grad_(residual.requires_grad)
-
-        na_w = norm_attn_weight.detach(norm_attn_weight.requires_grad)
-        na_b = norm_attn_bias.detach(norm_attn_bias.requires_grad)
-
-        wqkv_w = Wqkv_weight.detach().requires_grad_(Wqkv_weight.requires_grad)
-        wqkv_b = Wqkv_bias.detach().requires_grad_(Wqkv_bias.requires_grad)
-        out_w = out_proj_weight.detach().requires_grad_(out_proj_weight.requires_grad)
-        out_b = out_proj_bias.detach().requires_grad_(out_proj_bias.requires_grad)
-
-        nm_w = norm_mlp_weight.detach().requires_grad_(norm_mlp_weight.requires_grad)
-        nm_b = norm_mlp_bias.detach().requires_grad_(norm_mlp_bias.requires_grad)
-
-        f1_w = fc1_weight.detach().requires_grad_(fc1_weight.requires_grad)
-        f1_b = fc1_bias.detach().requires_grad_(fc1_bias.requires_grad)
-        f2_w = fc2_weight.detach().requires_grad_(fc2_weight.requires_grad)
-        f2_b = fc2_bias.detach().requires_grad_(fc2_bias.requires_grad)
-
-        out, res_out = _bf16_block_func(
-            hs,
-            res,
-            cu_seqlens,
-            max_seqlen,
-            na_w,
-            na_b,
-            wqkv_w,
-            wqkv_b,
-            out_w,
-            out_b,
-            nm_w,
-            nm_b,
-            f1_w,
-            f1_b,
-            f2_w,
-            f2_b,
-            num_heads,
-            head_dim,
-            causal,
-            attn_dropout_p,
-            softmax_scale,
-            window_left,
-            window_right,
-            deterministic,
-            resid_dropout1_p,
-            resid_dropout2_p,
-            training,
-            norm_attn_eps,
-            norm_mlp_eps,
-            is_varlen
-        )
-
-        grads = torch.autograd.grad(
-            outputs=(out, res_out),
-            inputs=(
-                hs,
-                res,
-                na_w,
-                na_b,
-                wqkv_w,
-                wqkv_b,
-                out_w,
-                out_b,
-                nm_w,
-                nm_b,
-                f1_w,
-                f1_b,
-                f2_w,
-                f2_b
-            ),
-            grad_outputs=(grad_out, grad_residual_out),
-            allow_unused=True,
-            retain_graph=False,
-            create_graph=False
-        )
-
-    refs = (
-        hidden_states,
-        residual,
-        norm_attn_weight,
-        norm_attn_bias,
-        Wqkv_weight,
-        Wqkv_bias,
-        out_proj_weight,
-        out_proj_bias,
-        norm_mlp_weight,
-        norm_mlp_bias,
-        fc1_weight,
-        fc1_bias,
-        fc2_weight,
-        fc2_bias
-    )
-
-    fixed = []
-    for g, ref in zip(grads, refs):
-        fixed.append(torch.zeros_like(ref) if g is None else g.to(dtype=ref.dtype))
-
-    return tuple(fixed)
-
-@bf16_block_backward.register_fake
-def _(grad_out: Tensor,
-    grad_residual_out: Tensor,
-
-    hidden_states: Tensor,
-    residual: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-
-    norm_attn_weight: Tensor,
-    norm_attn_bias: Tensor,
-
-    Wqkv_weight: Tensor,
-    Wqkv_bias: Tensor,
-    out_proj_weight: Tensor,
-    out_proj_bias: Tensor,
-
-    norm_mlp_weight: Tensor,
-    norm_mlp_bias: Tensor,
-
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
-
-    num_heads: int,
-    head_dim: int,
-    causal: bool,
-
-    attn_dropout_p: float,
-    softmax_scale: float,
-    window_left: int,
-    window_right: int,
-    deterministic: bool,
-
-    resid_dropout1_p: float,
-    resid_dropout2_p: float,
-    training: bool,
-
-    norm_attn_eps: float,
-    norm_mlp_eps: float,
-    is_varlen: bool
+    head_dim: int
 ):
-    return (
-        torch.empty_like(hidden_states),
-        torch.empty_like(residual),
-        torch.empty_like(norm_attn_weight),
-        torch.empty_like(norm_attn_bias),
-        torch.empty_like(Wqkv_weight),
-        torch.empty_like(Wqkv_bias),
-        torch.empty_like(out_proj_weight),
-        torch.empty_like(out_proj_bias),
-        torch.empty_like(norm_mlp_weight),
-        torch.empty_like(norm_mlp_bias),
-        torch.empty_like(fc1_weight),
-        torch.empty_like(fc1_bias),
-        torch.empty_like(fc2_weight),
-        torch.empty_like(fc2_bias)
+    qkv = hidden_states.new_empty(
+        (*hidden_states.shape[:-1], 3, num_heads, head_dim),
+        dtype=torch.bfloat16
     )
+    residual1 = hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
+    mask1 = hidden_states.new_empty(hidden_states.shape, dtype=torch.bool)
+    mean = hidden_states.new_empty(hidden_states.shape[:-1], dtype=torch.float32)
+    rstd = hidden_states.new_empty(hidden_states.shape[:-1], dtype=torch.float32)
+    ln_out = hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
+    return qkv, residual1, mask1, mean, rstd, ln_out
 
-def _bf16_block_setup_context(ctx, inputs, output):
+def _pre_setup_context(ctx, inputs, output):
     (
         hidden_states,
         residual,
-        cu_seqlens,
-        max_seqlen,
-
-        norm_attn_weight,
-        norm_attn_bias,
-
-        Wqkv_weight,
-        Wqkv_bias,
-        out_proj_weight,
-        out_proj_bias,
-
-        norm_mlp_weight,
-        norm_mlp_bias,
-
-        fc1_weight,
-        fc1_bias,
-        fc2_weight,
-        fc2_bias,
-
-        num_heads,
-        head_dim,
-        causal,
-
-        attn_dropout_p,
-        softmax_scale,
-        window_left,
-        window_right,
-        deterministic,
-
-        resid_dropout1_p,
-        resid_dropout2_p,
+        norm_weight,
+        norm_bias,
+        wqkv_weight,
+        wqkv_bias,
+        resid_dropout_p,
         training,
-
-        norm_attn_eps,
-        norm_mlp_eps,
-        is_varlen
+        norm_eps,
+        num_heads,
+        head_dim
     ) = inputs
+
+    qkv, residual1, mask1, mean, rstd, ln_out = output
 
     ctx.save_for_backward(
         hidden_states,
         residual,
-        cu_seqlens,
-        norm_attn_weight,
-        norm_attn_bias,
-        Wqkv_weight,
-        Wqkv_bias,
-        out_proj_weight,
-        out_proj_bias,
-        norm_mlp_weight,
-        norm_mlp_bias,
-        fc1_weight,
-        fc1_bias,
-        fc2_weight,
-        fc2_bias
+        norm_weight,
+        norm_bias,
+        wqkv_weight,
+        wqkv_bias,
+        residual1,
+        mask1,
+        mean,
+        rstd,
+        ln_out
     )
-
-    ctx.max_seqlen = max_seqlen
+    ctx.resid_dropout_p = resid_dropout_p
+    ctx.training = training
+    ctx.norm_eps = norm_eps
     ctx.num_heads = num_heads
     ctx.head_dim = head_dim
-    ctx.causal = causal
 
-    ctx.attn_dropout_p = attn_dropout_p
-    ctx.softmax_scale = softmax_scale
-    ctx.window_left = window_left
-    ctx.window_right = window_right
-    ctx.deterministic = deterministic
-
-    ctx.resid_dropout1_p = resid_dropout1_p
-    ctx.resid_dropout2_p = resid_dropout2_p
-    ctx.training = training
-
-    ctx.norm_attn_eps = norm_attn_eps
-    ctx.norm_mlp_eps = norm_mlp_eps
-    ctx.is_varlen = is_varlen
-
-def _bf16_block_backward_autograd(ctx, grad_out, grad_residual_out):
+def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
     (
         hidden_states,
         residual,
-        cu_seqlens,
-        norm_attn_weight,
-        norm_attn_bias,
-        Wqkv_weight,
-        Wqkv_bias,
-        out_proj_weight,
-        out_proj_bias,
-        norm_mlp_weight,
-        norm_mlp_bias,
-        fc1_weight,
-        fc1_bias,
-        fc2_weight,
-        fc2_bias
+        norm_weight,
+        norm_bias,
+        wqkv_weight,
+        wqkv_bias,
+        residual1,
+        mask1,
+        mean,
+        rstd,
+        ln_out
     ) = ctx.saved_tensors
 
-    grads = torch.ops.larlib.bf16_block_backward(
-        grad_out,
-        grad_residual_out,
+    grad_qkv = torch.zeros_like(
+        ln_out.view(*ln_out.shape[:-1], 3, ctx.num_heads, ctx.head_dim)
+    ) if grad_qkv is None else grad_qkv
+    grad_residual1 = torch.zeros_like(residual1) if grad_residual1 is None else grad_residual1
 
-        hidden_states,
-        residual,
-        cu_seqlens,
-        ctx.max_seqlen,
+    grad_qkv_lin = grad_qkv.reshape(*ln_out.shape[:-1], -1).contiguous()
 
-        norm_attn_weight,
-        norm_attn_bias,
+    wqkv_weight_bf16 = _to_bf16(wqkv_weight)
+    grad_ln_out, grad_wqkv_w, grad_wqkv_b = _linear_bwd(
+        grad_qkv_lin,
+        ln_out,
+        wqkv_weight_bf16
+    )
 
-        Wqkv_weight,
-        Wqkv_bias,
+    grad_residual1_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
+        grad_ln_out,
+        residual1,
+        mean,
+        rstd,
+        norm_weight,
+        norm_bias
+    )
+
+    grad_residual1_total = grad_residual1.float() + grad_residual1_from_ln
+
+    grad_hidden = _dropout_bwd(
+        grad_residual1_total.to(torch.bfloat16),
+        mask1,
+        ctx.resid_dropout_p,
+        ctx.training,
+    )
+    grad_residual = grad_residual1_total
+
+    return (
+        grad_hidden.to(hidden_states.dtype),
+        grad_residual.to(residual.dtype),
+        grad_norm_w.to(norm_weight.dtype),
+        grad_norm_b.to(norm_bias.dtype),
+        grad_wqkv_w.to(wqkv_weight.dtype),
+        grad_wqkv_b.to(wqkv_bias.dtype),
+        None,
+        None,
+        None,
+        None,
+        None
+    )
+
+pre_attn_qkv.register_autograd(_pre_backward, setup_context=_pre_setup_context)
+
+@torch.library.custom_op("legendblock::post_attn_mlp", mutates_args=(), device_types="cuda")
+def post_attn_mlp(
+    attn_out: Tensor,
+    residual1: Tensor,
+    out_proj_weight: Tensor,
+    out_proj_bias: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    fc1_weight: Tensor,
+    fc1_bias: Tensor,
+    fc2_weight: Tensor,
+    fc2_bias: Tensor,
+    resid_dropout_p: float,
+    training: bool,
+    norm_eps: float
+):
+    attn_out_bf16 = _to_bf16(attn_out)
+    residual1_bf16 = _to_bf16(residual1)
+
+    out_proj_weight_bf16 = _to_bf16(out_proj_weight)
+    out_proj_bias_bf16 = _to_bf16(out_proj_bias)
+    attn_proj = _linear_fwd(attn_out_bf16, out_proj_weight_bf16, out_proj_bias_bf16)
+
+    dropped2, mask2 = _dropout_fwd(attn_proj, resid_dropout_p, training)
+    residual2 = residual1_bf16 + dropped2
+
+    ln_out, mean, rstd = _layernorm_fwd_fp32(
+        residual2,
+        norm_weight,
+        norm_bias,
+        norm_eps
+    )
+
+    fc1_weight_bf16 = _to_bf16(fc1_weight)
+    fc1_bias_bf16 = _to_bf16(fc1_bias)
+    gelu_in = _linear_fwd(ln_out, fc1_weight_bf16, fc1_bias_bf16)
+    gelu_out = _gelu_fwd_tanh(gelu_in)
+
+    fc2_weight_bf16 = _to_bf16(fc2_weight)
+    fc2_bias_bf16 = _to_bf16(fc2_bias)
+    out = _linear_fwd(gelu_out, fc2_weight_bf16, fc2_bias_bf16)
+
+    return out, residual2, mask2, mean, rstd, ln_out, gelu_in, gelu_out
+
+@post_attn_mlp.register_fake
+def _(
+    attn_out: Tensor,
+    residual1: Tensor,
+    out_proj_weight: Tensor,
+    out_proj_bias: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    fc1_weight: Tensor,
+    fc1_bias: Tensor,
+    fc2_weight: Tensor,
+    fc2_bias: Tensor,
+    resid_dropout_p: float,
+    training: bool,
+    norm_eps: float
+):
+    out = attn_out.new_empty(attn_out.shape, dtype=torch.bfloat16)
+    residual2 = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
+    mask2 = residual1.new_empty(residual1.shape, dtype=torch.bool)
+    mean = residual1.new_empty(residual1.shape[:-1], dtype=torch.float32)
+    rstd = residual1.new_empty(residual1.shape[:-1], dtype=torch.float32)
+    ln_out = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
+    hidden_dim = fc1_weight.shape[0]
+    gelu_in = residual1.new_empty((*residual1.shape[:-1], hidden_dim), dtype=torch.bfloat16)
+    gelu_out = residual1.new_empty((*residual1.shape[:-1], hidden_dim), dtype=torch.bfloat16)
+    return out, residual2, mask2, mean, rstd, ln_out, gelu_in, gelu_out
+
+def _post_setup_context(ctx, inputs, output):
+    (
+        attn_out,
+        residual1,
         out_proj_weight,
         out_proj_bias,
-
-        norm_mlp_weight,
-        norm_mlp_bias,
-
+        norm_weight,
+        norm_bias,
         fc1_weight,
         fc1_bias,
         fc2_weight,
         fc2_bias,
+        resid_dropout_p,
+        training,
+        norm_eps
+    ) = inputs
 
-        ctx.num_heads,
-        ctx.head_dim,
-        ctx.causal,
+    out, residual2, mask2, mean, rstd, ln_out, gelu_in, gelu_out = output
 
-        ctx.attn_dropout_p,
-        ctx.softmax_scale,
-        ctx.window_left,
-        ctx.window_right,
-        ctx.deterministic,
+    ctx.save_for_backward(
+        attn_out,
+        residual1,
+        out_proj_weight,
+        out_proj_bias,
+        norm_weight,
+        norm_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+        residual2,
+        mask2,
+        mean,
+        rstd,
+        ln_out,
+        gelu_in,
+        gelu_out
+    )
+    ctx.resid_dropout_p = resid_dropout_p
+    ctx.training = training
+    ctx.norm_eps = norm_eps
 
-        ctx.resid_dropout1_p,
-        ctx.resid_dropout2_p,
-        ctx.training,
+def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
+    (
+        attn_out,
+        residual1,
+        out_proj_weight,
+        out_proj_bias,
+        norm_weight,
+        norm_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+        residual2,
+        mask2,
+        mean,
+        rstd,
+        ln_out,
+        gelu_in,
+        gelu_out
+    ) = ctx.saved_tensors
 
-        ctx.norm_attn_eps,
-        ctx.norm_mlp_eps,
-        ctx.is_varlen
+    grad_out = torch.zeros_like(attn_out) if grad_out is None else grad_out
+    grad_residual2_total = torch.zeros_like(residual2, dtype=torch.float32) if grad_residual2 is None else grad_residual2.float()
+
+    fc2_weight_bf16 = _to_bf16(fc2_weight)
+    grad_gelu_out, grad_fc2_w, grad_fc2_b = _linear_bwd(
+        grad_out,
+        gelu_out,
+        fc2_weight_bf16
     )
 
-    (
-        grad_hidden_states,
-        grad_residual,
-        grad_norm_attn_weight,
-        grad_norm_attn_bias,
-        grad_Wqkv_weight,
-        grad_Wqkv_bias,
-        grad_out_proj_weight,
-        grad_out_proj_bias,
-        grad_norm_mlp_weight,
-        grad_norm_mlp_bias,
-        grad_fc1_weight,
-        grad_fc1_bias,
-        grad_fc2_weight,
-        grad_fc2_bias
-    ) = grads
+    grad_gelu_in = _gelu_bwd_tanh(grad_gelu_out, gelu_in)
+
+    fc1_weight_bf16 = _to_bf16(fc1_weight)
+    grad_ln_out, grad_fc1_w, grad_fc1_b = _linear_bwd(
+        grad_gelu_in,
+        ln_out,
+        fc1_weight_bf16
+    )
+
+    grad_residual2_from_ln, grad_norm_w, grad_norm_b = _layernorm_bwd_fp32(
+        grad_ln_out,
+        residual2,
+        mean,
+        rstd,
+        norm_weight,
+        norm_bias
+    )
+    grad_residual2_total = grad_residual2_total + grad_residual2_from_ln
+
+    grad_residual1 = grad_residual2_total
+    grad_attn_proj = _dropout_bwd(
+        grad_residual2_total.to(torch.bfloat16),
+        mask2,
+        ctx.resid_dropout_p,
+        ctx.training
+    )
+
+    out_proj_weight_bf16 = _to_bf16(out_proj_weight)
+    grad_attn_out, grad_outproj_w, grad_outproj_b = _linear_bwd(
+        grad_attn_proj,
+        _to_bf16(attn_out),
+        out_proj_weight_bf16
+    )
 
     return (
-        grad_hidden_states,
-        grad_residual,
+        grad_attn_out.to(attn_out.dtype),
+        grad_residual1.to(residual1.dtype),
+        grad_outproj_w.to(out_proj_weight.dtype),
+        grad_outproj_b.to(out_proj_bias.dtype),
+        grad_norm_w.to(norm_weight.dtype),
+        grad_norm_b.to(norm_bias.dtype),
+        grad_fc1_w.to(fc1_weight.dtype),
+        grad_fc1_b.to(fc1_bias.dtype),
+        grad_fc2_w.to(fc2_weight.dtype),
+        grad_fc2_b.to(fc2_bias.dtype),
         None,
         None,
-
-        grad_norm_attn_weight,
-        grad_norm_attn_bias,
-
-        grad_Wqkv_weight,
-        grad_Wqkv_bias,
-        grad_out_proj_weight,
-        grad_out_proj_bias,
-
-        grad_norm_mlp_weight,
-        grad_norm_mlp_bias,
-
-        grad_fc1_weight,
-        grad_fc1_bias,
-        grad_fc2_weight,
-        grad_fc2_bias,
-
-        None,
-        None,
-        None,
-
-        None,
-        None,
-        None,
-        None,
-        None,
-
-        None,
-        None,
-        None,
-
-        None,
-        None,
-        None,
+        None
     )
 
-bf16_block_forward.register_autograd(
-    _bf16_block_backward_autograd,
-    setup_context=_bf16_block_setup_context,
-)
-
+post_attn_mlp.register_autograd(_post_backward, setup_context=_post_setup_context)
 
 class Block(nn.Module):
     def __init__(
@@ -694,7 +459,7 @@ class Block(nn.Module):
         mixer_cls,
         mlp_cls,
         resid_dropout1,
-        resid_dropout2,
+        resid_dropout2
     ):
         super(Block, self).__init__()
 
@@ -710,66 +475,72 @@ class Block(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        residual: Tensor | None,
-        cu_seqlens: Tensor | None,
-        max_seqlen: int | None,
-    ) -> tuple[Tensor, Tensor]:
+        residual: Optional[Tensor] = None,
+        cu_seqlens: Optional[Tensor] = None,
+        max_seqlen: Optional[int] = None
+    ) -> Tuple[Tensor, Tensor]:
         residual_in = residual if residual is not None else torch.zeros_like(hidden_states)
 
-        attn = self.mixer.attn
-        softmax_scale = (
-            attn.softmax_scale
-            if attn.softmax_scale is not None
-            else 1.0 / math.sqrt(self.mixer.head_dim)
-        )
-
-        is_varlen = cu_seqlens is not None
-        if is_varlen:
-            cu_seqlens_in = cu_seqlens
-            max_seqlen_in = int(max_seqlen)
-        else:
-            cu_seqlens_in = torch.empty(0, device=hidden_states.device, dtype=torch.int32)
-            max_seqlen_in = 0
-
-        hidden_states, residual_out = torch.ops.larlib.bf16_block_forward(
+        # dropout -> resid -> qkv 
+        qkv, residual1 = torch.ops.legendblock.pre_attn_qkv(
             hidden_states,
             residual_in,
-            cu_seqlens_in,
-            max_seqlen_in,
-
             self.norm_attn.weight,
             self.norm_attn.bias,
-
             self.mixer.Wqkv.weight,
             self.mixer.Wqkv.bias,
+            self.dropout1.p,
+            self.training,
+            self.norm_attn.eps,
+            self.mixer.num_heads,
+            self.mixer.head_dim
+        )
+
+        # qkv -> attn
+        attn_cfg = self.mixer.attn
+        if cu_seqlens is None:
+            attn_out = flash_attn_qkvpacked_func(
+                qkv,
+                dropout_p=attn_cfg.drop.p if self.training else 0.0,
+                softmax_scale=attn_cfg.softmax_scale,
+                causal=self.mixer.causal,
+                window_size=attn_cfg.window_size,
+                softcap=0.0,
+                alibi_slopes=None,
+                deterministic=attn_cfg.deterministic,
+                return_attn_probs=False
+            )
+        else:
+            attn_out = flash_attn_varlen_qkvpacked_func(
+                qkv,
+                cu_seqlens,
+                int(max_seqlen),
+                dropout_p=attn_cfg.drop.p if self.training else 0.0,
+                softmax_scale=attn_cfg.softmax_scale,
+                causal=self.mixer.causal,
+                window_size=attn_cfg.window_size,
+                softcap=0.0,
+                alibi_slopes=None,
+                deterministic=attn_cfg.deterministic,
+                return_attn_probs=False
+            )
+        attn_out = attn_out.reshape(*hidden_states.shape[:-1], self.mixer.emb_dim)
+
+        # linear -> drop -> resid -> mlp
+        out, residual2 = torch.ops.legendblock.post_attn_mlp(
+            attn_out,
+            residual1,
             self.mixer.out_proj.weight,
             self.mixer.out_proj.bias,
-
             self.norm_mlp.weight,
             self.norm_mlp.bias,
-
             self.mlp.fc1.weight,
             self.mlp.fc1.bias,
             self.mlp.fc2.weight,
             self.mlp.fc2.bias,
-
-            self.mixer.num_heads,
-            self.mixer.head_dim,
-            self.mixer.causal,
-
-            attn.drop.p,
-            softmax_scale,
-            attn.window_size[0],
-            attn.window_size[1],
-            attn.deterministic,
-
-            self.dropout1.p,
             self.dropout2.p,
             self.training,
-
-            self.norm_attn.eps,
-            self.norm_mlp.eps,
-            is_varlen
+            self.norm_mlp.eps
         )
 
-        return hidden_states, residual_out
+        return out, residual2
