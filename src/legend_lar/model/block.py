@@ -511,7 +511,7 @@ class Block(nn.Module):
         else:
             attn_out = flash_attn_varlen_qkvpacked_func(
                 qkv,
-                cu_seqlens,
+                cu_seqlens.to(torch.int32),
                 int(max_seqlen),
                 dropout_p=attn_cfg.drop.p if self.training else 0.0,
                 softmax_scale=attn_cfg.softmax_scale,

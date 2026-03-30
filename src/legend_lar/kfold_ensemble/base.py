@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+from genericpath import isdir
 import os
+from typing import List, Tuple
 
 import random
 
@@ -12,19 +14,27 @@ cfg.autotune_local_cache = False
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 
-from legend_lar.utils import BootstrappedKFoldConfig
-from legend_lar.data import BootstrappedKFoldLArListDataset, CollateFn, KFoldBootstrap_worker_init_fn
+from legend_lar.utils import NRECConfig, InitRNG
+from legend_lar.data import ParallelBootstrappedKFoldLArListDataset, NRECCollateFn, ParallelKFoldBootstrap_worker_init_fn
 
 class TrainerBase(ABC):
     def __init__(
         self,
-        config: BootstrappedKFoldConfig,
+        config: NRECConfig,
+        rank: int,
+        world_size: int,
         device: str | int,
-        load_both_indices: bool = False
+        tmp_dir: str
     ):
+        self.tmp_dir = tmp_dir
+        os.makedirs(self.tmp_dir, exist_ok=True)
+
         self.device = device
         self.config = config
-        self.load_both_indices = load_both_indices
+
+        self.rank = rank
+        self.world_size = world_size
+
         self._init_loss_store()
 
         self.BASE_SEED = self.config.rng_seed
@@ -33,17 +43,17 @@ class TrainerBase(ABC):
         self.rng_seed_for_data_plit = self.BASE_RNG.getrandbits(64)
         self.rng_seed_for_bootstrap = self.BASE_RNG.getrandbits(64)
         self.rng_seed_for_data_sampling = self.BASE_RNG.getrandbits(64)
+        self.rng_seed_for_model_reinit = self.BASE_RNG.getrandbits(64)
         self._set_model_initializer()
 
         self._init_dataloader()
 
         self.best_val_loss = 9999.
         self.patience = 0
-        self.current_bid = -1
+        self.last_saved_epoch = None
 
-    @abstractmethod
-    def _set_model_initializer(self):
-        pass
+        self.current_fid = None
+        self.current_bid = None
 
     def _init_loss_store(self):
         self.train_loss = []
@@ -52,64 +62,76 @@ class TrainerBase(ABC):
     def _init_dataloader(self):
         self.mode_value = mp.Value("i", 0)
         self.fid_value = mp.Value("i", 0)
-        self.change_bootstrap_id_value = mp.Value("i", 1)
+        self.bid_value = mp.Value("i", 0)
+        self.epoch_value = mp.Value("i", 0)
 
-        self.dataset = BootstrappedKFoldLArListDataset(
-            lar_paths=self.config.data_paths,
+        self.dataset = ParallelBootstrappedKFoldLArListDataset(
+            lar_paths=self.config.lar_paths,
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
             batch_size=self.config.local_batch_size,
-            labels=self.config.labels,
-            prior=self.config.prior,
-            hpge_path=self.config.hpge_id_and_energy,
-            hpge_energy_mean=self.config.hpge_energy_mean,
-            hpge_energy_std=self.config.hpge_energy_std,
+            hpge_path=self.config.hpge_path,
+            hpge_feats_mean=self.config.hpge_feats_mean,
+            hpge_feats_std=self.config.hpge_feats_std,
             rng_seed_for_split=self.rng_seed_for_data_plit,
             times_of_mixing=self.config.times_of_mixing,
             bootstrap_rng_seed=self.rng_seed_for_bootstrap,
             global_rng_seed_for_sampling=self.rng_seed_for_data_sampling,
             num_folds=self.config.num_folds,
             num_bootstraps_per_fold=self.config.num_bootstraps_per_fold,
-            sg_train_val_cal_test_frac=self.config.sg_train_val_cal_test_frac,
+            sg_train_val=self.config.sg_train_val,
             mode=self.mode_value,
             fold_id=self.fid_value,
-            change_bootstrap_id=self.change_bootstrap_id_value,
-            load_both_indices=self.load_both_indices
+            bootstrap_id=self.bid_value,
+            epoch_id=self.epoch_value
         )
-        self.collate_fn = CollateFn(
-            num_sipm_chs=self.config.num_sipms,
+        self.collate_fn = NRECCollateFn(
             cuda_device=self.device
         )
         self.dataloader = DataLoader(
             dataset=self.dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=2,
+            num_workers=8,
             pin_memory=False,
             prefetch_factor=4,
             persistent_workers=True,
-            worker_init_fn=KFoldBootstrap_worker_init_fn,
+            worker_init_fn=ParallelKFoldBootstrap_worker_init_fn,
             collate_fn=self.collate_fn
         )
 
         self.k_fold = self.dataset.indices["bg"]["test_folds"]
+        for fid in range(self.config.num_folds):
+            fold_indices = np.array(self.k_fold['fold_{i}'.format(i=fid)], dtype=np.int64)
+            fold_dir = f'{self.config.save_to}/fid_{fid}'
+            os.makedirs(fold_dir, exist_ok=True)
+            np.save(f'{fold_dir}/fold_indices.npy', fold_indices)
+
+    def _set_model_initializer(self):
+        self.model_initiator = InitRNG(
+            device=self.device
+        )
+
+    def get_model_reinit_seed(self, fid: int, bid: int):
+        return self.rng_seed_for_model_reinit + self.config.num_folds * fid + bid
 
     @abstractmethod
-    def reset_model_and_optimizer(self):
+    def reset_model_and_optimizer(self, fid: int, bid: int, start_from_epoch: int = 1):
         pass
 
-    def save_checkpoint(self, epoch: int):
-        save_dir = f'{self.config.save_to}/fid_{self.fid_value.value}/bid_{self.current_bid}'
+    def save_checkpoint(self, fid: int, bid: int, epoch: int):
+        save_dir = f'{self.config.save_to}/fid_{fid}/bid_{bid}'
         os.makedirs(save_dir, exist_ok=True)
         try:
             os.remove(f'{save_dir}/model.pt')
         except:
             pass
         torch.save({
-            "fid": self.fid_value.value,
-            "bid": self.current_bid,
+            "fid": fid,
+            "bid": bid,
             "epoch": epoch,
             "model": self.model.module.state_dict() if hasattr(self.model, "module") else self.model.state_dict(),
+            "model_opt": self.model_opt.state_dict(),
 
             "train_loss": self.train_loss,
             "val_loss": self.val_loss
@@ -131,47 +153,64 @@ class TrainerBase(ABC):
     def val_epoch(self):
         pass
 
-    def train_one_bootstrap(self):
-        self.dataloader.dataset.set_bid_flag(1) # instruct the workers to create a fresh bootstrap of the current fold
-        self.current_bid += 1
+    def train_and_val_one_epoch(self, epoch: int):
+        self.dataloader.dataset.set_epoch(epoch)
 
-        self.reset_model_and_optimizer()
-        print(f'fid_{self.fid_value.value}, bid_{self.current_bid}')
-        for epoch in range(1, self.config.max_epochs+1):
-            self.dataloader.dataset.set_mode(0) # training mode
-            self.model.train()
-            self.train_epoch()
-            self.dataloader.dataset.set_bid_flag(0) # instruct the workers to not create a fresh bootstrap of the current fold anymore
+        # training
+        self.dataloader.dataset.set_mode(0)
+        self.model.train()
+        self.train_epoch()
 
-            self.dataloader.dataset.set_mode(1) # validation mode
-            self.model.eval()
-            self.val_epoch()
+        # validation
+        self.dataloader.dataset.set_mode(1)
+        self.model.eval()
+        self.val_epoch()
 
-            print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")
-            delta_loss = self.best_val_loss - self.val_loss[-1]
-            min_delta = self.config.rel_tolerance * self.best_val_loss
-            if delta_loss > min_delta:
-                self.best_val_loss = self.val_loss[-1]
-                self.save_checkpoint(epoch)
-                self.patience = 0
-            else:
-                self.patience += 1
+        print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")
+
+        delta_loss = self.best_val_loss - self.val_loss[-1]
+        min_delta = self.config.rel_tolerance * self.best_val_loss
+        if delta_loss > min_delta:
+            self.best_val_loss = self.val_loss[-1]
+            self.save_checkpoint(epoch)
+            self.patience = 0
+
+            path = f'{self.tmp_dir}/{self.current_fid}_{self.current_bid}_{self.last_saved_epoch}'
+            if os.path.isdir(path):
+                os.rmdir(path)
+
+            self.last_saved_epoch = epoch
+            os.makedirs(f'{self.tmp_dir}/{self.current_fid}_{self.current_bid}_{self.last_saved_epoch}')
+        else:
+            self.patience += 1
+
+    def train_one_model(self, fid: int, bid: int, start_from_epoch: int = 1):
+        self.current_fid = fid
+        self.current_bid = bid
+
+        self.dataloader.dataset.set_fold_id(bid)
+        self.dataloader.dataset.set_bootstrap_id(bid)
+        self.reset_model_and_optimizer(fid, bid, start_from_epoch)
+
+        if start_from_epoch == 1:
+            print(f'fid_{fid}, bid_{bid} training started')
+        else:
+            print(f'fid_{fid}, bid_{bid} training continued')
+
+        for epoch in range(start_from_epoch, self.config.max_epochs+1):
+            self.train_and_val_one_epoch(epoch)
 
             if self.patience == self.config.patience:
                 break
-        self.best_val_loss = 9999.
+
+        path = f'{self.tmp_dir}/{self.current_fid}_{self.current_bid}_{self.last_saved_epoch}'
+        os.rmdir(path)
+        os.makedirs(f'{path}_done')
+
+        self.best_val_loss = 99999.
         self.patience = 0
         self._init_loss_store()
 
-    def train_folds(self):
-        for fid in range(self.config.num_folds):
-            self.dataloader.dataset.set_fold_id(fid)
-
-            fold_indices = np.array(self.dataloader.dataset.indices["bg"]["test_folds"]['fold_{i}'.format(i=int(self.fid_value.value))], dtype=np.int64)
-            fold_dir = f'{self.config.save_to}/fid_{self.fid_value.value}'
-            os.makedirs(fold_dir, exist_ok=True)
-            np.save(f'{fold_dir}/fold_indices.npy', fold_indices)
-
-            self.current_bid = -1
-            for _ in range(self.config.num_bootstraps_per_fold):
-                self.train_one_bootstrap()
+    def train(self, to_be_trained: List[List[int, int, int]]):
+        for fid, bid, start_from_epoch in to_be_trained:
+            self.train_one_model(fid, bid, start_from_epoch)

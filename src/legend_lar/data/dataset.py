@@ -262,7 +262,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         mode_value = self.mode if isinstance(self.mode, int) else self.mode.value
         if mode_value == 0:
             seed = self.global_rng_seed_for_sampling + self.num_folds*self.fold_id.value + self.bootstrap_id.value
-            seed = seed + self.epoch_id
+            seed = seed + self.epoch_id.value
             self.sampling_rng = np.random.default_rng(seed)
 
         if mode_value == 0:
