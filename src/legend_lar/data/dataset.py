@@ -3,14 +3,13 @@ import multiprocessing as mp
 
 from torch.utils.data import IterableDataset, get_worker_info
 
-from scipy.sparse import load_npz
-from numpy.lib.format import open_memmap
 import numpy as np
+import scipy
+
 
 class LArDatasetBase:
-    def __init__(self, path: str):
-        self.path = path
-        self.dataset = load_npz(self.path)
+    def __init__(self, dataset: scipy.sparse._csr.csr_matrix):
+        self.dataset = dataset
 
     def __getitem__(self, indices):
         indices = indices[~np.isnan(indices)].astype(np.int64)
@@ -32,11 +31,9 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
     """
     def __init__(
         self,
-        lar_paths: list[str],
         num_t_bins: int,
         num_sipm_chs: int,
         batch_size: int,
-        hpge_path: str = None,
         hpge_feats_mean: list[float] = None,
         hpge_feats_std: list[float] = None,
         calib_partitioning_nums: list[int] = None,
@@ -66,8 +63,8 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.times_of_mixing = times_of_mixing
         self.bootstrap_rng_seed = bootstrap_rng_seed
 
-        self.hpge_path = hpge_path
-        self.lar_paths = lar_paths
+        self.hpge_dataset = None
+        self.lar_datasets = None
         self.hpge_feats_mean = hpge_feats_mean
         self.hpge_feats_std = hpge_feats_std
 
@@ -90,8 +87,11 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.bootstrap_id_cache = None
         self.epoch_id = epoch_id
 
-        self._set_mixed_indices()
-        self._set_folds_indices()
+    def _load_datasets(self, hpge_dataset, lar_datasets):
+        assert get_worker_info() is not None, "Can only be called by each worker to avoid pickling errors"
+
+        self.hpge_dataset = hpge_dataset
+        self.lar_datasets = lar_datasets
 
     def set_mode(self, mode: int):
         """To be called by the main process before iteration. mode value is stored in a multiprocessing.Value."""
@@ -127,12 +127,12 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
     def _set_mixed_indices(self):
         # Monotonicly increasing default indices
         self.data_lengths = [
-            load_npz(path).shape[0] for path in self.lar_paths
+            dataset.shape[0] for dataset in self.lar_datasets
         ]
         mixed_indices = [np.arange(mixing_idx).astype(np.int64) for mixing_idx in self.data_lengths]
 
         rng = np.random.default_rng(self.rng_seed_for_split)
-        for i in range(len(self.lar_paths)):
+        for i in range(len(self.lar_datasets)):
             # Shuffle the default indices
             permuted_idx = mixed_indices[i]
             for _ in range(self.times_of_mixing):
@@ -157,7 +157,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
         # train and val mode
         if mode_value in (0, 1):
-            assert len(self.lar_paths) == 2
+            assert len(self.lar_datasets) == 2
             # label 0 data (sg / RC dataset) is treated to have 1 fold
             sg_data_cumsum = self._get_data_chunks_cumsum(int(self.data_lengths[0]), self.sg_train_val)
             # label 1 data with k folds (bg / physics)
@@ -198,21 +198,24 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
     def _set_sg_and_bg_datasets(self):
         assert get_worker_info() is not None, "Can only be called by each worker inside worker_init"
-        if self.hpge_path is not None:
-            self.hpge_dataset = open_memmap(self.hpge_path, mode="r").copy()
-            # TODO: modify the standardization of hpge features once the data structure is agreed upon
-            self.hpge_dataset[:, 1] = (self.hpge_dataset[:, 1] - self.hpge_energy_mean) / self.hpge_energy_std # energy is transformed to have zero mean and unit variance
-        else:
-            self.hpge_dataset = None
+        if self.hpge_dataset is not None:
+            mean = np.array(self.hpge_feats_mean).reshape(1, -1)
+            std = np.array(self.hpge_feats_std).reshape(1, -1)
+            self.hpge_dataset = (self.hpge_dataset - mean) / std
 
         self.dataset = [
-            LArDatasetBase(self.lar_paths[i]) for i in range(len(self.lar_paths))
+            LArDatasetBase(self.lar_datasets[i]) for i in range(len(self.lar_datasets))
         ] # sg, bg
 
-    def _worker_init(self):
+    def _worker_init(self, hpge_dataset, lar_datasets):
         worker_info = get_worker_info()
         self.worker_id = worker_info.id
         self.num_workers = worker_info.num_workers
+
+        self._load_datasets(hpge_dataset, lar_datasets)
+        self._set_mixed_indices()
+        self._set_folds_indices()
+
         self._set_sg_and_bg_datasets()
 
     def _set_current_bootstrap_indices(self):
@@ -329,7 +332,11 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
             indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
             yield batch, gE, indices
 
-def ParallelKFoldBootstrap_worker_init_fn(worker_id: int):
+
+def ParallelKFoldBootstrap_worker_init_fn(hpge_dataset, lar_datasets, worker_id: int):
+    """
+        Has to be wrapped using functools.partial to avoid self.hpge_dataset and self.lar_datasets being pickled
+    """
     worker_info = get_worker_info()
     dataset: ParallelBootstrappedKFoldLArListDataset = worker_info.dataset
-    dataset._worker_init()
+    dataset._worker_init(hpge_dataset, lar_datasets)

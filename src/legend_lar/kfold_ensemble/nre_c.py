@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import scipy
 
 import torch
 import torch._inductor.config as cfg
@@ -13,19 +14,41 @@ import torch.nn.functional as F
 from apex.optimizers import FusedMixedPrecisionLamb
 
 from legend_lar.model import NREC
-from legend_lar.utils import NRECConfig, _initialize_configs, _init_torch
+from legend_lar.utils import FileDB, NRECConfig, _initialize_configs, _init_torch
 
 from legend_lar.kfold_ensemble.base import TrainerBase
 
 class NRECTrainer(TrainerBase):
     def __init__(
         self,
+        file_db: FileDB,
+        partition: str,
+        model_name: str,
+        version: str,
+        config: NRECConfig,
+        hpge_dataset: np.ndarray,
+        lar_datasets: scipy.sparse._csr.csr_matrix,
         lar_detector_coords: Tensor,
         hpge_detector_coords: Tensor,
-        config: NRECConfig,
-        device: str | int
+        rank: int,
+        world_size: int,
+        device: str | int,
+        tmp_dir: str
     ):
-        super(NRECTrainer, self).__init__(config, device, True)
+        super(NRECTrainer, self).__init__(
+            file_db=file_db,
+            partition=partition,
+            model_name=model_name,
+            version=version,
+            config=config,
+            hpge_dataset=hpge_dataset,
+            lar_datasets=lar_datasets,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            tmp_dir=tmp_dir
+        )
+
         self.lar_detector_coords = lar_detector_coords
         self.hpge_detector_coords = hpge_detector_coords
 
@@ -40,7 +63,7 @@ class NRECTrainer(TrainerBase):
             self.model,
             self.get_model_reinit_seed(fid, bid)
         )
-    
+
     def _init_optimizer(self, model_opt_state = None):
         self.model_opt = FusedMixedPrecisionLamb(
             params=self.model.parameters(),
@@ -66,11 +89,18 @@ class NRECTrainer(TrainerBase):
                 cleaned_key = key.replace('_orig_mod.', '')
                 cleaned_dict[cleaned_key] = value
             return cleaned_dict
-        
-        last_epoch = start_from_epoch - 1
-        save_dir = f'{self.config.save_to}/fid_{fid}/bid_{bid}'
 
-        cp = torch.load(f'{save_dir}/model.pt', map_location=self.device)
+        last_epoch = start_from_epoch - 1
+        save_path = self.file_db.build_file(
+            tier="models",
+            partition=self.partition,
+            model_name=self.model_name,
+            version=self.version,
+            fid=fid,
+            bid=bid
+        )
+
+        cp = torch.load(save_path, map_location=self.device)
         epoch = cp["epoch"]
         if epoch != last_epoch:
             raise ValueError(f'Variable last_epoch with value ({last_epoch}) is different from the last saved checkpoint ({epoch})')
@@ -84,10 +114,10 @@ class NRECTrainer(TrainerBase):
 
         self.train_loss = cp["train_loss"]
         self.val_loss = cp["val_loss"]
-    
+
     def calculate_loss(self, logits: Tensor, K: int):
         logK = math.log(K)
-        loggamma = math.log(self.config.gamma)
+        loggamma = 0.0 if self.config.gamma == 1 else math.log(self.config.gamma)
 
         logits = torch.cat(
             [
@@ -142,7 +172,7 @@ class NRECTrainer(TrainerBase):
     def train_batch(
         self, *args, **kwargs
     ):
-        
+
         loss = self.forward_batch(*args, **kwargs)
         self.model_opt.zero_grad()
         loss.backward()
@@ -202,32 +232,58 @@ class NRECTrainer(TrainerBase):
         n_step = 1 / n_step
         self.val_loss.append(loss * n_step)
 
-def train_contrastive(experiment: str, model_name: str, version: str, working_dir: str, data_dir: str, tmp_dir: str, training_config: str):
+def train_contrastive(
+    experiment: str,
+    partition: str,
+    model_name: str,
+    version: str,
+    dataflow_dir: str,
+    base_cfg_name: str,
+    tmp_dir: str
+):
     local_rank, rank, world_size, device = _init_torch()
-    wd = Path(working_dir)
-    mmpd = Path(data_dir)
 
-    config, data_config, paths = _initialize_configs(
-        config_obj=NRECConfig(),
-        wd=wd,
-        experiment=experiment,
-        model_name=model_name,
-        version=version,
-        mmpd=mmpd,
-        training_config=training_config
+    file_db = FileDB(
+        working_dir=dataflow_dir,
+        experiment=experiment
     )
 
-    config.lar_paths = [str(paths.data_dir / f"{key}.npz") for key in data_config.keys() if str(key) != "hpge_path"]
-    config.hpge_path = data_config["hpge_path"]
-    config.hpge_path = str(paths.data_dir / f'{config.hpge_path}.npy')
+    base_cfg = file_db.build_file(
+        tier="base_configs",
+        filename=base_cfg_name
+    )
+
+    model_cfg = file_db.build_file(
+        tier="model_config",
+        partition=partition,
+        model_name=model_name,
+        version=version
+    )
+
+    model_cfg, data_config = _initialize_configs(
+        config_obj=NRECConfig(),
+        config_path=model_cfg,
+        base_config=base_cfg
+    )
 
     # TODO: handling detector coordinates are still missing
     trainer = NRECTrainer(
-        config=config,
-        device=device
+        file_db=file_db,
+        partition=partition,
+        model_name=model_name,
+        version=version,
+        config=model_cfg,
+        hpge_dataset=None,
+        lar_datasets=None,
+        lar_detector_coords=None,
+        hpge_detector_coords=None,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        tmp_dir=tmp_dir
     )
 
-    to_be_trained = np.ones((config.num_folds, config.num_bootstraps_per_fold))
+    to_be_trained = np.ones((model_cfg.num_folds, model_cfg.num_bootstraps_per_fold))
     to_be_trained = np.stack(to_be_trained.nonzero()).T
     start_from_epoch = np.ones(len(to_be_trained)).reshape(-1, 1)
     to_be_trained = np.concatenate((to_be_trained, start_from_epoch), axis=-1)
@@ -237,12 +293,12 @@ def train_contrastive(experiment: str, model_name: str, version: str, working_di
         meta = path.split("_")
         if len(meta) == 3:
             meta = np.array(meta).astype(int)
-            global_id = config.num_folds * meta[0] + meta[1]
+            global_id = model_cfg.num_folds * meta[0] + meta[1]
             if meta[-1] != 1:
                 to_be_trained[global_id, -1] = meta[-1]
         elif len(meta) == 4:
             meta = np.array(meta[:3]).astype(int)
-            global_id = config.num_folds * meta[0] + meta[1]
+            global_id = model_cfg.num_folds * meta[0] + meta[1]
             remove_id.append(remove_id)
 
     to_be_trained = np.delete(to_be_trained, remove_id, axis=0)

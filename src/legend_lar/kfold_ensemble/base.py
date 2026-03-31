@@ -1,11 +1,11 @@
 from abc import ABC, abstractmethod
-from genericpath import isdir
 import os
-from typing import List, Tuple
+from typing import List
 
 import random
 
 import numpy as np
+import scipy
 
 import torch
 import torch._inductor.config as cfg
@@ -14,13 +14,21 @@ cfg.autotune_local_cache = False
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 
-from legend_lar.utils import NRECConfig, InitRNG
+from legend_lar.utils import FileDB, NRECConfig, InitRNG
 from legend_lar.data import ParallelBootstrappedKFoldLArListDataset, NRECCollateFn, ParallelKFoldBootstrap_worker_init_fn
+
+from functools import partial
 
 class TrainerBase(ABC):
     def __init__(
         self,
+        file_db: FileDB,
+        partition: str,
+        model_name: str,
+        version: str,
         config: NRECConfig,
+        hpge_dataset: np.ndarray,
+        lar_datasets: scipy.sparse._csr.csr_matrix,
         rank: int,
         world_size: int,
         device: str | int,
@@ -28,6 +36,11 @@ class TrainerBase(ABC):
     ):
         self.tmp_dir = tmp_dir
         os.makedirs(self.tmp_dir, exist_ok=True)
+
+        self.file_db = file_db
+        self.partition = partition
+        self.model_name = model_name
+        self.version = version
 
         self.device = device
         self.config = config
@@ -46,7 +59,7 @@ class TrainerBase(ABC):
         self.rng_seed_for_model_reinit = self.BASE_RNG.getrandbits(64)
         self._set_model_initializer()
 
-        self._init_dataloader()
+        self._init_dataloader(hpge_dataset, lar_datasets)
 
         self.best_val_loss = 9999.
         self.patience = 0
@@ -59,18 +72,16 @@ class TrainerBase(ABC):
         self.train_loss = []
         self.val_loss = []
 
-    def _init_dataloader(self):
+    def _init_dataloader(self, hpge_dataset, lar_datasets):
         self.mode_value = mp.Value("i", 0)
         self.fid_value = mp.Value("i", 0)
         self.bid_value = mp.Value("i", 0)
         self.epoch_value = mp.Value("i", 0)
 
         self.dataset = ParallelBootstrappedKFoldLArListDataset(
-            lar_paths=self.config.lar_paths,
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
             batch_size=self.config.local_batch_size,
-            hpge_path=self.config.hpge_path,
             hpge_feats_mean=self.config.hpge_feats_mean,
             hpge_feats_std=self.config.hpge_feats_std,
             rng_seed_for_split=self.rng_seed_for_data_plit,
@@ -88,6 +99,11 @@ class TrainerBase(ABC):
         self.collate_fn = NRECCollateFn(
             cuda_device=self.device
         )
+        worker_init_fn = partial(
+            ParallelKFoldBootstrap_worker_init_fn,
+            hpge_dataset,
+            lar_datasets
+        )
         self.dataloader = DataLoader(
             dataset=self.dataset,
             batch_size=None,
@@ -96,16 +112,22 @@ class TrainerBase(ABC):
             pin_memory=False,
             prefetch_factor=4,
             persistent_workers=True,
-            worker_init_fn=ParallelKFoldBootstrap_worker_init_fn,
+            worker_init_fn=worker_init_fn,
             collate_fn=self.collate_fn
         )
 
         self.k_fold = self.dataset.indices["bg"]["test_folds"]
         for fid in range(self.config.num_folds):
             fold_indices = np.array(self.k_fold['fold_{i}'.format(i=fid)], dtype=np.int64)
-            fold_dir = f'{self.config.save_to}/fid_{fid}'
-            os.makedirs(fold_dir, exist_ok=True)
-            np.save(f'{fold_dir}/fold_indices.npy', fold_indices)
+            fold_path = self.file_db.build_file(
+                tier="fold_ids",
+                partition=self.partition,
+                model_name=self.model_name,
+                version=self.version,
+                fid=fid
+            )
+            os.makedirs(os.path.dirname(fold_path), exist_ok=True)
+            np.save(fold_path, fold_indices)
 
     def _set_model_initializer(self):
         self.model_initiator = InitRNG(
@@ -120,12 +142,18 @@ class TrainerBase(ABC):
         pass
 
     def save_checkpoint(self, fid: int, bid: int, epoch: int):
-        save_dir = f'{self.config.save_to}/fid_{fid}/bid_{bid}'
-        os.makedirs(save_dir, exist_ok=True)
-        try:
-            os.remove(f'{save_dir}/model.pt')
-        except:
-            pass
+        save_path = self.file_db.build_file(
+            tier="models",
+            partition=self.partition,
+            model_name=self.model_name,
+            version=self.version,
+            fid=fid,
+            bid=bid
+        )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if os.path.isfile(save_path):
+            os.remove(save_path)
+
         torch.save({
             "fid": fid,
             "bid": bid,
@@ -135,7 +163,7 @@ class TrainerBase(ABC):
 
             "train_loss": self.train_loss,
             "val_loss": self.val_loss
-        }, f'{save_dir}/model.pt')
+        }, save_path)
 
     @abstractmethod
     def train_batch(self):

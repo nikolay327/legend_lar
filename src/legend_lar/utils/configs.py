@@ -1,12 +1,8 @@
 import os
-import shutil
-from typing import Tuple
-from dataclasses import dataclass
-from pathlib import Path
-
-from typing import Tuple, Dict
-
 import json
+import shutil
+from typing import Tuple, Dict
+from dataclasses import dataclass
 
 @dataclass
 class NRECConfig:
@@ -69,69 +65,38 @@ class NRECConfig:
     betas_model: Tuple[float, float] = None
     weight_decay: float = None
 
-    save_to: str = None
 
-@dataclass(frozen=True)
-class Paths:
-    root: Path # working dir
-    trained: Path # trained models dir
-    db_conf: Path # database configs
-    data_dir: Path # dir containing training data
-
-    def make_checkpoint_dir(self, experiment: str, model_name: str, version: str):
-        if self.data_dir is None:
-            raise ValueError("data_dir cannot be None")
-        (self.trained / experiment / model_name / version / "checkpoints").mkdir(parents=True, exist_ok=True)
-
-def load_config(config_json: str, working_dir: Path, data_dir: Path) -> Tuple[Dict, Dict, Paths]:
+def _load_meta_from_config(config_json: str) -> Tuple[Dict, Dict]:
     with open(config_json, "r") as f:
         config_json = json.load(f)
     model_config = config_json["model_config"]
     data_config = {key: config_json[key] for key in config_json if key != "model_config"}
 
-    paths = Paths(
-        root = working_dir,
-        trained= working_dir / "trained",
-        db_conf = working_dir / "meta",
-        data_dir = data_dir
-    )
+    return model_config, data_config
 
-    return model_config, data_config, paths
-
-def init_config(paths: Paths, experiment: str, model_name: str, version: str, model_config: dict, config_obj = None):
+def _parse_meta_to_config(model_config: dict, config_obj = None):
     config = NRECConfig() if config_obj is None else config_obj
     config.__dict__.update(model_config)
 
-    config.save_to = str(paths.trained / experiment / model_name / version / "checkpoints")
     return config
 
 def _initialize_configs(
     config_obj: NRECConfig,
-    wd: Path,
-    experiment: str,
-    model_name: str,
-    version: str,
-    mmpd: Path,
-    training_config: str = None
-) -> Tuple[NRECConfig, dict, Paths]:
-    config_json = wd / "trained" / experiment / model_name / version / f"{model_name}_{version}.json"
-    os.makedirs(os.path.dirname(str(config_json)), exist_ok=True)
-    if training_config is not None and not config_json.exists():
-        shutil.copy(training_config, config_json)
+    config_path: str,
+    base_config: str = None
+) -> Tuple[NRECConfig, dict]:
+    os.makedirs(os.path.dirname(str(config_path)), exist_ok=True)
 
-    model_config, data_config, paths = load_config(config_json, wd, mmpd)
-    paths.make_checkpoint_dir(experiment, model_name, version)
+    if not os.path.isfile(config_path):
+        if base_config is None:
+            raise ValueError(f'variable base_config with {base_config} cannot be None when arg config_path is not a file')
+        else:
+            shutil.copy(base_config, config_path)
 
-    config = init_config(
-        paths=paths,
-        experiment=experiment,
-        model_name=model_name,
-        version=version,
-        model_config=model_config,
-        config_obj=config_obj
-    )
+    model_config, data_config = _load_meta_from_config(config_path)
+    config = _parse_meta_to_config(model_config, config_obj)
 
-    return config, data_config, paths
+    return config, data_config
 
 @dataclass
 class EvalConfig:
