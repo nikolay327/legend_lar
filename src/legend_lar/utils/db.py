@@ -8,7 +8,6 @@ import warnings
 
 from string import Formatter
 
-import build
 
 def _custom_formatwarning(msg, category, filename, lineno, line=None):
     """

@@ -164,7 +164,10 @@ class HPGeEncoder(nn.Module):
             num_phi_harmonics=self.config.num_phi_harmonics
         )
         self.det_emb = nn.Embedding(self.config.num_hpges, self.config.hidden_size)
-        self.partitioning_emb = nn.Embedding(self.config.hpge_global_partitioning_size, self.config.hidden_size)
+        if self.config.subpartition_hpge_feats == 1:
+            self.partitioning_emb = nn.Embedding(self.config.hpge_global_partitioning_size, self.config.hidden_size)
+        else:
+            self.partitioning_emb = None
 
         self.features_tokenizer = ContinuousFourierTokenizer(
             emb_dim=self.config.hidden_size,
@@ -201,8 +204,16 @@ class HPGeEncoder(nn.Module):
 
         cls_mask = f_idx == self.cls_placeholder_id
         gid_mask = f_idx == 0
-        pid_mask = f_idx == 1
-        feat_mask = ~(cls_mask | gid_mask | pid_mask)
+        if self.config.subpartition_hpge_feats == 1:
+            pid_mask = f_idx == 1
+            feat_mask = ~(cls_mask | gid_mask | pid_mask)
+            feats_start = 2
+
+            partitioning_emb = self.partitioning_emb(f_vals[pid_mask].to(torch.long))
+        else:
+            feat_mask = ~(cls_mask | gid_mask)
+            feats_start = 1
+            partitioning_emb = None
 
         # detector hit tokenizer
         gid = f_vals[gid_mask].to(torch.long())
@@ -215,11 +226,8 @@ class HPGeEncoder(nn.Module):
         phi_tokens = phi_tokens + det_emb
         z_tokens = z_tokens + det_emb
 
-        # partitioning emb
-        partitioning_emb = self.partitioning_emb(f_vals[pid_mask].to(torch.long))
-
         # feature tokens
-        feat_emb = self.features_tokenizer(f_vals[feat_mask]) + self.features_id_emb(f_idx[feat_mask] - 2)
+        feat_emb = self.features_tokenizer(f_vals[feat_mask]) + self.features_id_emb(f_idx[feat_mask] - feats_start)
 
         # compute the new packed layout
         N_old = f_vals.shape[0]
@@ -258,7 +266,8 @@ class HPGeEncoder(nn.Module):
         tokens[gid_start + 2] = z_tokens
 
         # partitioning tokens
-        tokens[start_pos[pid_mask]] = partitioning_emb
+        if self.config.subpartition_hpge_feats == 1:
+            tokens[start_pos[pid_mask]] = partitioning_emb
 
         # feature tokens
         tokens[start_pos[feat_mask]] = feat_emb

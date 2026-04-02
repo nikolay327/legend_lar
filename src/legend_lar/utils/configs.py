@@ -31,6 +31,10 @@ class NRECConfig:
     num_rz_bands: int = None
     max_freq_log2_rz: float = None
     num_phi_harmonics: int = None
+    r_shift: float = None
+    r_inv_scale: float = None
+    z_shift: float = None
+    z_inv_scale: float = None
 
     # LAr encoder
     num_sipms: int = None
@@ -55,6 +59,7 @@ class NRECConfig:
     hpge_path: str = None
     hpge_feats_mean: list[float] = None
     hpge_feats_std: list[float] = None
+    subpartition_hpge_feats: int = None
 
     # Training hyperparams
     local_batch_size: int = None

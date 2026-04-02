@@ -1,10 +1,14 @@
 import os
 import math
+import yaml
 from pathlib import Path
 
 import numpy as np
+from numpy.lib.format import open_memmap
 import scipy
+import pandas as pd
 
+import scipy.sparse
 import torch
 import torch._inductor.config as cfg
 cfg.autotune_local_cache = False
@@ -232,7 +236,8 @@ class NRECTrainer(TrainerBase):
         n_step = 1 / n_step
         self.val_loss.append(loss * n_step)
 
-def train_contrastive(
+
+def train(
     experiment: str,
     partition: str,
     model_name: str,
@@ -266,17 +271,52 @@ def train_contrastive(
         base_config=base_cfg
     )
 
-    # TODO: handling detector coordinates are still missing
+    hpge_dataset = file_db.build_file(
+        tier="training",
+        filename=data_config["hpge_dataset"]
+    )
+    # load into RAM
+    hpge_dataset = open_memmap(
+        filename=hpge_dataset,
+        mode="r"
+    ).copy()
+
+    lar_datasets = [
+        file_db.build_file(
+        tier="training",
+        filename=data_config["lar_datasets"][i]
+    ) for i in range(2)
+    ]
+    lar_datasets = [scipy.sparse.load_npz(path) for path in lar_datasets]
+
+    # decode detector positions
+    det_geom_and_subpart = file_db.build_file(
+        tier="dataset",
+        filename="detector_positions.yaml"
+    )
+    with open(det_geom_and_subpart, "r") as f:
+        det_geom_and_subpart = yaml.safe_load(f)
+    det_geom_and_subpart = pd.json_normalize(det_geom_and_subpart.values()).sort_values("id", ascending=True, ignore_index=True)
+
+    det_geom_and_subpart["r"] = det_geom_and_subpart["r"].map(lambda x: (x - model_cfg.r_shift) / model_cfg.r_inv_scale)
+    det_geom_and_subpart["phi"] = det_geom_and_subpart["phi"].map(lambda x: x * np.pi / 180)
+    det_geom_and_subpart["z"] = det_geom_and_subpart["z"].map(lambda x: (x - model_cfg.z_shift) / model_cfg.z_inv_scale)
+
+    hpge_detector_coords = det_geom_and_subpart[det_geom_and_subpart["id"] < model_cfg.num_hpges][["r", "phi", "z"]].to_numpy()
+    lar_detector_coords = det_geom_and_subpart[det_geom_and_subpart["id"] >= model_cfg.num_hpges][["r", "phi", "z"]].to_numpy()
+    hpge_detector_coords = torch.from_numpy(hpge_detector_coords).float()
+    lar_detector_coords = torch.from_numpy(lar_detector_coords).float()
+
     trainer = NRECTrainer(
         file_db=file_db,
         partition=partition,
         model_name=model_name,
         version=version,
         config=model_cfg,
-        hpge_dataset=None,
-        lar_datasets=None,
-        lar_detector_coords=None,
-        hpge_detector_coords=None,
+        hpge_dataset=hpge_dataset,
+        lar_datasets=lar_datasets,
+        lar_detector_coords=lar_detector_coords,
+        hpge_detector_coords=hpge_detector_coords,
         rank=rank,
         world_size=world_size,
         device=device,
@@ -314,13 +354,14 @@ def train_contrastive(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Training started")
-    parser.add_argument("experiment", type=str)
-    parser.add_argument("model_name", type=str, help="Name of the model being trained")
-    parser.add_argument("version", type=str)
-    parser.add_argument("working_dir", type=str, help="Top-most dir of the training pipeline")
-    parser.add_argument("data_dir", type=str, help="Directory the training data is saved under")
-    parser.add_argument("training_config", type=str, help="JSON config file of the training, which contains model and training configurations, data configs, etc.")
-    parser.add_argument("cache_dir", type=str, help="Directory to store torch.inductor and triton cache")
+    parser.add_argument("experiment", type=str, help="Name of the experiment")
+    parser.add_argument("partition", type=str, help="partition name")
+    parser.add_argument("model_name", type=str, help="Name of the model")
+    parser.add_argument("version", type=str, help="Model version")
+    parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
+    parser.add_argument("base_cfg_name", type=str, help="Name of the base json config")
+    parser.add_argument("tmp_dir", type=str, help="Directory for storing temporary files")
+    parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
     args = parser.parse_args()
 
     import os
@@ -338,4 +379,12 @@ if __name__ == "__main__":
 
     JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
 
-    train_contrastive(args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)
+    train(
+        args.experiment,
+        args.partition,
+        args.model_name,
+        args.version,
+        args.dataflow_dir,
+        args.base_cfg_name,
+        args.tmp_dir
+    )
