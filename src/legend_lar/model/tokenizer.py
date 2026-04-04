@@ -56,7 +56,7 @@ class ContinuousFourierTokenizer(nn.Module):
         dtype: torch.dtype = torch.float32
     ):
         super(ContinuousFourierTokenizer, self).__init__()
-        
+
         self.emb_dim = int(emb_dim)
 
         self.scalar_emb = FourierScalarEmbedding(
@@ -72,7 +72,7 @@ class ContinuousFourierTokenizer(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, emb_dim)
         )
-    
+
     def forward(self, x: Tensor):
         """
             x: (B, )
@@ -81,7 +81,7 @@ class ContinuousFourierTokenizer(nn.Module):
         tokens = self.scalar_emb(x)
         tokens = self.proj(tokens) # (B, D)
         return tokens # (B, D)
-    
+
 class DetectorGeometryFeatureTable(nn.Module):
     """
         Fixed geometry-feature lookup table for detector IDs using cylindrical coordinates (r, phi, z).
@@ -118,7 +118,7 @@ class DetectorGeometryFeatureTable(nn.Module):
         self.register_buffer("r_features", r_feat, persistent=True)
         self.register_buffer("phi_features", phi_feat, persistent=True)
         self.register_buffer("z_features", z_feat, persistent=True)
-    
+
     def _build_geometry_features(
         self,
         coords: Tensor, # (N, 3)
@@ -171,7 +171,7 @@ class DetectorGeometryFeatureTable(nn.Module):
         z_parts.append(torch.sin(z_angles))
         z_parts.append(torch.cos(z_angles))
         z_feat = torch.cat(z_parts, dim=-1)
-    
+
         return r_feat, phi_feat, z_feat
 
     @property

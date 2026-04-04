@@ -273,6 +273,7 @@ def train(
 
     hpge_dataset = file_db.build_file(
         tier="training",
+        partition=partition,
         filename=data_config["hpge_dataset"]
     )
     # load into RAM
@@ -284,6 +285,7 @@ def train(
     lar_datasets = [
         file_db.build_file(
         tier="training",
+        partition=partition,
         filename=data_config["lar_datasets"][i]
     ) for i in range(2)
     ]
@@ -292,6 +294,7 @@ def train(
     # decode detector positions
     det_geom_and_subpart = file_db.build_file(
         tier="dataset",
+        partition=partition,
         filename="detector_positions.yaml"
     )
     with open(det_geom_and_subpart, "r") as f:
