@@ -113,6 +113,10 @@ def pack_hpge_nrec_data(x: Tensor, cls_placeholder_id: int, return_meta: bool = 
     f_sort = torch.where(is_not_cls.bool(), f_all, torch.zeros_like(f_all))
     key = ((b_all * 2 + is_not_cls) * H) + f_sort
     order = torch.argsort(key)
+
+    b_all = b_all[order]
+    f_all = f_all[order]
+    v_all = v_all[order]
     # Packed tokens are now contiguous by batch, with CLS first in every sequence
 
     # cu_seqlens and max_seqlen for FlashAttention varlen
