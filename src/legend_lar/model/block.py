@@ -108,7 +108,7 @@ def pre_attn_qkv(
     norm_eps: float,
     num_heads: int,
     head_dim: int
-):
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     hs = _to_bf16(hidden_states)
     res = _to_bf16(residual)
 
@@ -269,7 +269,7 @@ def post_attn_mlp(
     resid_dropout_p: float,
     training: bool,
     norm_eps: float
-):
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     attn_out_bf16 = _to_bf16(attn_out)
     residual1_bf16 = _to_bf16(residual1)
 
