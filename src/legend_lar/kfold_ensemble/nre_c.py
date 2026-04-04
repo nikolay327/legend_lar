@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from apex.optimizers import FusedMixedPrecisionLamb
 
 from legend_lar.model import NREC
-from legend_lar.utils import FileDB, NRECConfig, _initialize_configs, _init_torch
+from legend_lar.utils import FileDB, NRECConfig, _initialize_configs, _init_torch, decode_geom
 
 from legend_lar.kfold_ensemble.base import TrainerBase
 
@@ -297,18 +297,7 @@ def train(
         partition=partition,
         filename="detector_positions.yaml"
     )
-    with open(det_geom_and_subpart, "r") as f:
-        det_geom_and_subpart = yaml.safe_load(f)
-    det_geom_and_subpart = pd.json_normalize(det_geom_and_subpart.values()).sort_values("id", ascending=True, ignore_index=True)
-
-    det_geom_and_subpart["r"] = det_geom_and_subpart["r"].map(lambda x: (x - model_cfg.r_shift) / model_cfg.r_inv_scale)
-    det_geom_and_subpart["phi"] = det_geom_and_subpart["phi"].map(lambda x: x * np.pi / 180)
-    det_geom_and_subpart["z"] = det_geom_and_subpart["z"].map(lambda x: (x - model_cfg.z_shift) / model_cfg.z_inv_scale)
-
-    hpge_detector_coords = det_geom_and_subpart[det_geom_and_subpart["id"] < model_cfg.num_hpges][["r", "phi", "z"]].to_numpy()
-    lar_detector_coords = det_geom_and_subpart[det_geom_and_subpart["id"] >= model_cfg.num_hpges][["r", "phi", "z"]].to_numpy()
-    hpge_detector_coords = torch.from_numpy(hpge_detector_coords).float()
-    lar_detector_coords = torch.from_numpy(lar_detector_coords).float()
+    lar_detector_coords, hpge_detector_coords = decode_geom(det_geom_and_subpart, model_cfg)
 
     trainer = NRECTrainer(
         file_db=file_db,
