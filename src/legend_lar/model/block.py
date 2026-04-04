@@ -40,20 +40,29 @@ def _linear_fwd(x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
     return torch.ops.aten.linear.default(x, weight, bias)
 
 def _linear_bwd(grad_y: Tensor, x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    grad_x, grad_w, grad_b = torch.ops.aten.linear_backward.default(
-        x,
-        grad_y,
-        weight,
-        [True, True, True]
-    )
+    in_features = x.shape[-1]
+    out_features = grad_y.shape[-1]
+
+    x2 = x.reshape(-1, in_features).contiguous()
+    gy2 = grad_y.reshape(-1, out_features).contiguous()
+
+    grad_x = grad_y.matmul(weight)
+
+    grad_w = torch.bmm(
+        gy2.transpose(0, 1).unsqueeze(0),
+        x2.unsqueeze(0),
+        out_dtype=torch.float32,
+    ).squeeze(0)
+    grad_b = gy2.sum(dim=0, dtype=torch.float32)
+
     return grad_x, grad_w, grad_b
 
 # gelu
 def _gelu_fwd_tanh(x: Tensor) -> Tensor:
-    return torch.ops.aten.gelu.default(x, "tanh")
+    return torch.ops.aten.gelu.default(x, approximate="tanh")
 
 def _gelu_bwd_tanh(grad_y: Tensor, x: Tensor) -> Tensor:
-    return torch.ops.aten.gelu_backward.default(grad_y, x, "tanh")
+    return torch.ops.aten.gelu_backward.default(grad_y, x, approximate="tanh")
 
 # layer_norm
 def _layernorm_fwd_fp32(
@@ -149,8 +158,11 @@ def _(
     )
     residual1 = hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
     mask1 = hidden_states.new_empty(hidden_states.shape, dtype=torch.bool)
-    mean = hidden_states.new_empty(hidden_states.shape[:-1], dtype=torch.float32)
-    rstd = hidden_states.new_empty(hidden_states.shape[:-1], dtype=torch.float32)
+
+    stat_shape = (*hidden_states.shape[:-1], 1)
+    mean = hidden_states.new_empty(stat_shape, dtype=torch.float32)
+    rstd = hidden_states.new_empty(stat_shape, dtype=torch.float32)
+
     ln_out = hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
     return qkv, residual1, mask1, mean, rstd, ln_out
 
@@ -317,8 +329,11 @@ def _(
     out = attn_out.new_empty(attn_out.shape, dtype=torch.bfloat16)
     residual2 = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
     mask2 = residual1.new_empty(residual1.shape, dtype=torch.bool)
-    mean = residual1.new_empty(residual1.shape[:-1], dtype=torch.float32)
-    rstd = residual1.new_empty(residual1.shape[:-1], dtype=torch.float32)
+
+    stat_shape = (*residual1.shape[:-1], 1)
+    mean = residual1.new_empty(stat_shape, dtype=torch.float32)
+    rstd = residual1.new_empty(stat_shape, dtype=torch.float32)
+
     ln_out = residual1.new_empty(residual1.shape, dtype=torch.bfloat16)
     hidden_dim = fc1_weight.shape[0]
     gelu_in = residual1.new_empty((*residual1.shape[:-1], hidden_dim), dtype=torch.bfloat16)
@@ -480,7 +495,7 @@ class Block(nn.Module):
         residual_in = residual if residual is not None else torch.zeros_like(hidden_states)
 
         # dropout -> resid -> qkv 
-        qkv, residual1 = torch.ops.legendblock.pre_attn_qkv(
+        qkv, residual1, *_ = torch.ops.legendblock.pre_attn_qkv(
             hidden_states,
             residual_in,
             self.norm_attn.weight,
@@ -525,7 +540,7 @@ class Block(nn.Module):
         attn_out = attn_out.reshape(*hidden_states.shape[:-1], self.mixer.emb_dim)
 
         # linear -> drop -> resid -> mlp
-        out, residual2 = torch.ops.legendblock.post_attn_mlp(
+        out, residual2, *_ = torch.ops.legendblock.post_attn_mlp(
             attn_out,
             residual1,
             self.mixer.out_proj.weight,

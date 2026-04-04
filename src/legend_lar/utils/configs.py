@@ -26,6 +26,7 @@ class NRECConfig:
     block_resid_dropout2: float = None
     attn_dropout: float = None
     causal: int = None
+    cls_placeholder_id: int = None
 
     # Geometry table general config
     num_rz_bands: int = None
@@ -39,7 +40,6 @@ class NRECConfig:
     # LAr encoder
     num_sipms: int = None
     num_sipm_t_bins: int = None
-    sipm_cls_placeholder_id: int = None
 
     sipm_num_layers: int = None
 
@@ -50,7 +50,6 @@ class NRECConfig:
     hpge_num_features: int = None
     hpge_num_feat_bands: int = None
     hpge_feat_max_freq_log2: float = None
-    hpge_cls_placeholder_id: int = None
 
     hpge_num_layers: int = None
 

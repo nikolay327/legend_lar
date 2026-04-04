@@ -97,6 +97,7 @@ class TrainerBase(ABC):
             epoch_id=self.epoch_value
         )
         self.collate_fn = NRECCollateFn(
+            cls_placeholder_id=self.config.cls_placeholder_id,
             cuda_device=self.device
         )
         worker_init_fn = partial(

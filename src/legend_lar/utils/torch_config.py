@@ -9,6 +9,7 @@ def _init_torch():
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+    torch._dynamo.config.capture_scalar_outputs = True
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
