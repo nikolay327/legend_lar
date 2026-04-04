@@ -107,19 +107,31 @@ class FileDB:
             pattern = pattern[1:]
 
         seen = set()
+        int_fields = set()
         regex = ""
-        last = 0
-        for m in re.finditer(r"\{(\w+)\}", pattern):
-            regex += re.escape(pattern[last:m.start()])
-            name = m.group(1)
-            if name not in seen:
-                regex += fr"(?P<{name}>[^/]+)"
-                seen.add(name)
+
+        for literal_text, field_name, format_spec, _ in Formatter().parse(pattern):
+            regex += re.escape(literal_text)
+
+            if field_name is None:
+                continue
+
+            if field_name not in seen:
+                if format_spec and format_spec.endswith("d"):
+                    m = re.fullmatch(r"0?(\d+)d", format_spec)
+                    if m:
+                        width = int(m.group(1))
+                        regex += rf"(?P<{field_name}>\d{{{width}}})"
+                    else:
+                        regex += rf"(?P<{field_name}>\d+)"
+                    int_fields.add(field_name)
+                else:
+                    regex += rf"(?P<{field_name}>[^/]+)"
+                seen.add(field_name)
             else:
-                regex += fr"(?P={name})"
-            last = m.end()
-        regex += re.escape(pattern[last:])
-        return regex
+                regex += rf"(?P={field_name})"
+
+        return regex, int_fields
 
     def decode_metadata_from_path(self, tier: str, path_to_file: str):
         """
@@ -135,12 +147,17 @@ class FileDB:
             dict: Mapping of placeholder names to their string values.
         """
         norm = path_to_file.replace(os.sep, "/")
-        regex = re.compile(self._build_regex_from_pattern(tier))
-        m = regex.search(norm)
+        regex, int_fields = self._build_regex_from_pattern(tier)
+        m = re.match(r"(?:^|.*/)" + regex + r"$", norm)
 
-        if not m:
-            raise ValueError(f'Path {path_to_file!r} doesn\'t match pattern {self.cfg["file_format"][tier]!r}')
-        return m.groupdict()
+        if m is None:
+            raise ValueError(f"Path does not match expected pattern: {path_to_file}")
+
+        out = m.groupdict()
+        for key in int_fields:
+            out[key] = int(out[key])
+
+        return out
     
     def parse_metadata_to_path(self, target_tier: str, **metadata):
         return self.cfg["tier_dirs"][target_tier] + self._build_pattern(tier=target_tier, overload=False, **metadata)
