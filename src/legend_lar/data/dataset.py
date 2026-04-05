@@ -31,6 +31,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
     """
     def __init__(
         self,
+        lar_data_lengths: list[int],
         num_t_bins: int,
         num_sipm_chs: int,
         batch_size: int,
@@ -87,6 +88,11 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.bootstrap_id_cache = None
         self.epoch_id = epoch_id
 
+        self.data_lengths = lar_data_lengths
+
+        self._set_mixed_indices()
+        self._set_folds_indices()
+
     def _load_datasets(self, hpge_dataset, lar_datasets):
         assert get_worker_info() is not None, "Can only be called by each worker to avoid pickling errors"
 
@@ -126,13 +132,10 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
     def _set_mixed_indices(self):
         # Monotonicly increasing default indices
-        self.data_lengths = [
-            dataset.shape[0] for dataset in self.lar_datasets
-        ]
         mixed_indices = [np.arange(mixing_idx).astype(np.int64) for mixing_idx in self.data_lengths]
 
         rng = np.random.default_rng(self.rng_seed_for_split)
-        for i in range(len(self.lar_datasets)):
+        for i in range(len(self.data_lengths)):
             # Shuffle the default indices
             permuted_idx = mixed_indices[i]
             for _ in range(self.times_of_mixing):
@@ -157,7 +160,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
         # train and val mode
         if mode_value in (0, 1):
-            assert len(self.lar_datasets) == 2
+            assert len(self.data_lengths) == 2
             # label 0 data (sg / RC dataset) is treated to have 1 fold
             sg_data_cumsum = self._get_data_chunks_cumsum(int(self.data_lengths[0]), self.sg_train_val)
             # label 1 data with k folds (bg / physics)
@@ -213,8 +216,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.num_workers = worker_info.num_workers
 
         self._load_datasets(hpge_dataset, lar_datasets)
-        self._set_mixed_indices()
-        self._set_folds_indices()
 
         self._set_sg_and_bg_datasets()
 

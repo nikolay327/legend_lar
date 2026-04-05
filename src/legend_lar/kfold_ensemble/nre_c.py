@@ -79,7 +79,7 @@ class NRECTrainer(TrainerBase):
         self._reinit_model(fid, bid)
 
         if start_from_epoch == 1:
-            self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
+            self.model = torch.compile(self.model, dynamic=True)
             self._init_optimizer()
             torch.cuda.empty_cache()
             return
@@ -109,7 +109,7 @@ class NRECTrainer(TrainerBase):
             self.last_saved_epoch = last_epoch
 
         self.model.load_state_dict(clean_state_dict(cp["model"]), strict=True)
-        self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=True)
+        self.model = torch.compile(self.model, dynamic=True)
 
         self._init_optimizer(cp["model_opt"])
 
@@ -184,7 +184,7 @@ class NRECTrainer(TrainerBase):
     def train_epoch(self):
         loss = 0.
         n_step = 0
-        for lar, hpge, _ in self.dataloader:
+        for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
             (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
 
@@ -212,7 +212,7 @@ class NRECTrainer(TrainerBase):
     def val_epoch(self):
         loss = 0.
         n_step = 0
-        for lar, hpge, _ in self.dataloader:
+        for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
             (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
 
@@ -227,7 +227,7 @@ class NRECTrainer(TrainerBase):
                 max_seqlen=int(max_seqlen)
             )
 
-            loss += loss_
+            loss += loss_.detach().item()
             n_step += 1
 
         n_step = 1 / n_step
@@ -331,6 +331,7 @@ def train(
             remove_id.append(remove_id)
 
     to_be_trained = np.delete(to_be_trained, remove_id, axis=0)
+    to_be_trained = to_be_trained.astype(int).tolist()
 
     shard_size = len(to_be_trained) // world_size
     if rank == (world_size - 1):

@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 def _init_torch():
@@ -28,5 +29,7 @@ def _init_torch():
     device = torch.device(f"cuda:{local_rank}")
 
     torch.cuda.set_device(device)
+
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device, init_method="env://")
 
     return local_rank, rank, world_size, device

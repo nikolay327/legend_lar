@@ -59,14 +59,14 @@ def create_base_dataset(
     # calibration
     sipm_data_sparse_calibration = sipm_data_sparse_fp[calibration_indices]
     path = file_db.build_file(
-        tier="inference",
+        tier="inference_dataset",
         partition="p16",
         filename="sipm_data_sparse_rc_ev_ep.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_calibration[: data_config["num_calib_data"]])
 
     path = file_db.build_file(
-        tier="inference",
+        tier="inference_dataset",
         partition="p16",
         filename="sipm_data_sparse_glob.npz"
     )

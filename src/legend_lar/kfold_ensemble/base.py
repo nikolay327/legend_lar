@@ -79,6 +79,7 @@ class TrainerBase(ABC):
         self.epoch_value = mp.Value("i", 0)
 
         self.dataset = ParallelBootstrappedKFoldLArListDataset(
+            lar_data_lengths=[dataset.shape[0] for dataset in lar_datasets],
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
             batch_size=self.config.local_batch_size,
@@ -117,18 +118,20 @@ class TrainerBase(ABC):
             collate_fn=self.collate_fn
         )
 
-        self.k_fold = self.dataset.indices["bg"]["test_folds"]
-        for fid in range(self.config.num_folds):
-            fold_indices = np.array(self.k_fold['fold_{i}'.format(i=fid)], dtype=np.int64)
-            fold_path = self.file_db.build_file(
-                tier="fold_ids",
-                partition=self.partition,
-                model_name=self.model_name,
-                version=self.version,
-                fid=fid
-            )
-            os.makedirs(os.path.dirname(fold_path), exist_ok=True)
-            np.save(fold_path, fold_indices)
+        if self.rank == 0:
+            k_fold = self.dataset.indices["bg"]["test_folds"]
+            for fid in range(self.config.num_folds):
+                fold_indices = np.array(k_fold['fold_{i}'.format(i=fid)], dtype=np.int64)
+                fold_path = self.file_db.build_file(
+                    tier="fold_ids",
+                    partition=self.partition,
+                    model_name=self.model_name,
+                    version=self.version,
+                    fid=fid
+                )
+                os.makedirs(os.path.dirname(fold_path), exist_ok=True)
+                np.save(fold_path, fold_indices)
+        torch.distributed.barrier()
 
     def _set_model_initializer(self):
         self.model_initiator = InitRNG(
@@ -182,7 +185,7 @@ class TrainerBase(ABC):
     def val_epoch(self):
         pass
 
-    def train_and_val_one_epoch(self, epoch: int):
+    def train_and_val_one_epoch(self, fid: int, bid: int, epoch: int):
         self.dataloader.dataset.set_epoch(epoch)
 
         # training
@@ -201,7 +204,7 @@ class TrainerBase(ABC):
         min_delta = self.config.rel_tolerance * self.best_val_loss
         if delta_loss > min_delta:
             self.best_val_loss = self.val_loss[-1]
-            self.save_checkpoint(epoch)
+            self.save_checkpoint(fid, bid, epoch)
             self.patience = 0
 
             path = f'{self.tmp_dir}/{self.current_fid}_{self.current_bid}_{self.last_saved_epoch}'
@@ -227,7 +230,7 @@ class TrainerBase(ABC):
             print(f'fid_{fid}, bid_{bid} training continued')
 
         for epoch in range(start_from_epoch, self.config.max_epochs+1):
-            self.train_and_val_one_epoch(epoch)
+            self.train_and_val_one_epoch(fid, bid, epoch)
 
             if self.patience == self.config.patience:
                 break
@@ -240,6 +243,6 @@ class TrainerBase(ABC):
         self.patience = 0
         self._init_loss_store()
 
-    def train(self, to_be_trained: List[List[int, int, int]]):
+    def train(self, to_be_trained: List[List[int]]):
         for fid, bid, start_from_epoch in to_be_trained:
             self.train_one_model(fid, bid, start_from_epoch)
