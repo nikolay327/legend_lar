@@ -215,31 +215,15 @@ class GeometryTokenizer(nn.Module):
     ):
         super(GeometryTokenizer, self).__init__()
 
-        self.r_proj = nn.Sequential(
-            nn.Linear(r_dim, hidded_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidded_size, emb_dim)
-        )
-        self.phi_proj = nn.Sequential(
-            nn.Linear(phi_dim, hidded_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidded_size, emb_dim)
-        )
-        self.z_proj = nn.Sequential(
-            nn.Linear(z_dim, hidded_size),
+        self.proj = nn.Sequential(
+            nn.Linear(r_dim + phi_dim + z_dim, hidded_size),
             nn.GELU(approximate="tanh"),
             nn.Linear(hidded_size, emb_dim)
         )
 
-    def forward(self, r_feat: Tensor, phi_feat: Tensor, z_feat: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-            return:
-                r_feat: (..., D)
-                phi_feat: (..., D)
-                z_feat: (..., D)
-        """
-        r_feat = self.r_proj(r_feat)
-        phi_feat = self.phi_proj(phi_feat)
-        z_feat = self.z_proj(z_feat)
-
-        return r_feat, phi_feat, z_feat
+    def forward(self, r_feat: Tensor, phi_feat: Tensor, z_feat: Tensor) -> Tensor:
+        feats = torch.cat(
+            [r_feat, phi_feat, z_feat], dim=-1
+        )
+        feats = self.proj(feats)
+        return feats

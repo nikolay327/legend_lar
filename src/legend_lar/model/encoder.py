@@ -66,79 +66,43 @@ class LArEncoder(nn.Module):
 
         # detector hits tokenizer
         r_tokens, phi_tokens, z_tokens = self.geometry_table(non_cls_det_hits)
-        r_tokens, phi_tokens, z_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
-
+        tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
         # residual detectorwise-information
-        det_emb = self.det_emb(non_cls_det_hits)
-        r_tokens = r_tokens + det_emb
-        phi_tokens = phi_tokens + det_emb
-        z_tokens = z_tokens + det_emb
-
+        tokens = tokens + self.det_emb(non_cls_det_hits)
         # time information
-        r_tokens = self.time_emb(r_tokens, non_cls_time_hits)
-        phi_tokens = self.time_emb(phi_tokens, non_cls_time_hits)
-        z_tokens = self.time_emb(z_tokens, non_cls_time_hits)
+        tokens = self.time_emb(tokens, non_cls_time_hits)
 
-        # compute the new packed layout with the old detector-hit token expanded to 3 tokens (r, phi, z)
-        exp_sizes = 1 + 2 * non_cls_mask.to(torch.long) # (N,), values in {1, 3}
-
-        # global start position of each old token in the new packed layout
-        start_pos = torch.cumsum(exp_sizes, dim=0) - exp_sizes # (N,)
-
-        total_new_tokens = int(exp_sizes.sum().item())
-        new_max_seqlen = int(3 * max_seqlen - 2)
-
-        # start positions of each sequence in the new packed layout
-        orig_seq_starts = cu_seqlens[:-1].to(torch.long) # (B,)
-        new_cu_seqlens = torch.empty_like(cu_seqlens)
-        new_cu_seqlens[:-1] = start_pos[orig_seq_starts].to(cu_seqlens.dtype)
-        new_cu_seqlens[-1] = total_new_tokens
-
-        # positions in the new packed layout
-        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
-        triplet_base = start_pos[non_cls_mask] # (N_hits,)
-
-        # materialize the new packed token tensor
-        tokens = torch.empty(
-            total_new_tokens,
+        new_tokens = torch.empty(
+            s_idx.shape[0],
             self.config.hidden_size,
             device=device,
             dtype=dtype
-        )  # (N_new, D)
+        )
 
         # write cls tokens
+        cls_pos = cu_seqlens[:-1].to(torch.long) # (B,)
         cls_src = self.cls_token.unsqueeze(0).expand(cls_pos.numel(), -1)
-        tokens.index_copy_(0, cls_pos, cls_src)
+        new_tokens.index_copy_(0, cls_pos, cls_src)
 
-        # write all geometry triplets
-        triplet_idx = torch.stack(
-            (triplet_base, triplet_base + 1, triplet_base + 2),
-            dim=1
-        ).reshape(-1) # (3 * N_hits,)
+        # write the rest of the tokens
+        new_tokens[non_cls_mask] = tokens
 
-        triplet_src = torch.stack(
-            (r_tokens, phi_tokens, z_tokens),
-            dim=1
-        ).reshape(-1, self.config.hidden_size) # (3 * N_hits, D)
+        new_tokens = new_tokens.contiguous()
 
-        tokens.index_copy_(0, triplet_idx, triplet_src)
-        tokens = tokens.contiguous()
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            residual = None
-            for block in self.blocks:
-                tokens, residual = block(
-                    hidden_states=tokens,
-                    residual=residual,
-                    cu_seqlens=new_cu_seqlens.to(torch.int32),
-                    max_seqlen=new_max_seqlen
-                )
+        residual = None
+        for block in self.blocks:
+            new_tokens, residual = block(
+                hidden_states=new_tokens,
+                residual=residual,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen
+            )
 
         # CLS pooling: first token in each packed sequence
-        tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
-        tokens = self.proj_out(tokens)
+        new_tokens = self.norm(residual[cls_pos].float() + new_tokens[cls_pos].float()) # (B, D)
+        new_tokens = self.proj_out(new_tokens)
 
-        return tokens # (B, D)
+        return new_tokens # (B, D)
 
 class HPGeEncoder(nn.Module):
     def __init__(
@@ -213,84 +177,46 @@ class HPGeEncoder(nn.Module):
         # detector hit tokenizer
         gid = f_vals[gid_mask].to(torch.long)
         r_tokens, phi_tokens, z_tokens = self.geometry_table(gid)
-        r_tokens, phi_tokens, z_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
-
+        geom_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
         # residual detectorwise-information
-        det_emb = self.det_emb(gid)
-        r_tokens = r_tokens + det_emb
-        phi_tokens = phi_tokens + det_emb
-        z_tokens = z_tokens + det_emb
+        geom_tokens = geom_tokens + self.det_emb(gid)
 
         # feature tokens
         feat_emb = self.features_tokenizer(f_vals[feat_mask]) + self.features_id_emb(f_idx[feat_mask] - feats_start)
 
-        # compute the new packed layout
-        N_old = f_vals.shape[0]
-
-        exp_sizes = torch.ones(N_old, dtype=torch.long, device=device)
-        exp_sizes[gid_mask] = 3
-
-        # global start position of each original token in the NEW packed layout
-        start_pos = torch.cumsum(exp_sizes, dim=0) - exp_sizes  # (N_old,)
-
-        total_new_tokens = int(exp_sizes.sum().item())
-
-        # the start of each new sequence is the expanded start position of the corresponding OLD sequence start.
-        orig_seq_starts = cu_seqlens[:-1].to(torch.long)  # (B,)
-        new_cu_seqlens = torch.empty_like(cu_seqlens)
-        new_cu_seqlens[:-1] = start_pos[orig_seq_starts].to(cu_seqlens.dtype)
-        new_cu_seqlens[-1] = torch.tensor(total_new_tokens, dtype=cu_seqlens.dtype, device=device)
-
-        new_max_seqlen = int(max_seqlen + 2)
-
-        # materialize the new packed token tensor
         tokens = torch.empty(
-            total_new_tokens,
+            f_idx.shape[0],
             self.config.hidden_size,
             device=device,
             dtype=dtype
-        ) # (N_new, D)
+        )
 
         # cls token
-        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
+        cls_pos = cu_seqlens[:-1].to(torch.long) # (B,)
         cls_src = self.cls_token.unsqueeze(0).expand(cls_pos.numel(), -1)
         tokens.index_copy_(0, cls_pos, cls_src)
 
-        # gid -> 3 coordinate tokens
-        gid_start = start_pos[gid_mask] # (N_gid,)
-        gid_idx = torch.stack(
-            (gid_start, gid_start + 1, gid_start + 2),
-            dim=1
-        ).reshape(-1) # (3 * N_gid,)
-
-        gid_src = torch.stack(
-            (r_tokens, phi_tokens, z_tokens),
-            dim=1
-        ).reshape(-1, self.config.hidden_size) # (3 * N_gid, D)
-
-        tokens.index_copy_(0, gid_idx, gid_src)
+        # gid token
+        tokens[gid_mask] = geom_tokens
 
         # partitioning tokens
         if self.config.subpartition_hpge_feats == 1:
-            pid_pos = start_pos[pid_mask]
-            tokens.index_copy_(0, pid_pos, partitioning_emb)
+            tokens[pid_mask] = partitioning_emb
 
         # feature tokens
-        feat_pos = start_pos[feat_mask]
-        tokens.index_copy_(0, feat_pos, feat_emb)
+        tokens[feat_mask] = feat_emb
 
         tokens = tokens.contiguous()
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            residual = None
-            for block in self.blocks:
-                tokens, residual = block(
-                    hidden_states=tokens,
-                    residual=residual,
-                    cu_seqlens=new_cu_seqlens.to(torch.int32),
-                    max_seqlen=new_max_seqlen
-                )
-        
+        residual = None
+        for block in self.blocks:
+            tokens, residual = block(
+                hidden_states=tokens,
+                residual=residual,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen
+            )
+
         # CLS pooling: first token in each packed sequence
         tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
         tokens = self.proj_out(tokens)
