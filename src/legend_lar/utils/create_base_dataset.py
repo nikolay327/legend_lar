@@ -24,7 +24,7 @@ def create_base_dataset(
         file_db.build_file(
             tier="training",
             partition="p16",
-            filename="geds_data_phy.lh5"
+            filename="geds_data_phy.npy"
         ), geds_data_phy
     )
     geds_data_phy = None
