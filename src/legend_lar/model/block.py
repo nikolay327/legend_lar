@@ -557,3 +557,44 @@ class Block(nn.Module):
         )
 
         return out, residual2
+
+# euqivalent implementation
+class Block_(nn.Module):
+    def __init__(
+        self,
+        emb_dim,
+        mixer_cls,
+        mlp_cls,
+        resid_dropout1,
+        resid_dropout2
+    ):
+        super(Block_, self).__init__()
+        
+        self.mixer = mixer_cls(emb_dim)
+        self.mlp = mlp_cls(emb_dim)
+
+        self.norm_attn = nn.LayerNorm(emb_dim)
+        self.norm_mlp = nn.LayerNorm(emb_dim)
+        
+        self.dropout1 = nn.Dropout(resid_dropout1)
+        self.dropout2 = nn.Dropout(resid_dropout2)
+    
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int
+    ) -> Tuple[Tensor, Tensor]:
+        # prenorm path
+        dropped = self.dropout1(hidden_states)
+        residual = (residual + dropped) if residual is not None else dropped
+
+        hidden_states = self.norm_attn(residual)
+        hidden_states = self.mixer(hidden_states, cu_seqlens, max_seqlen)
+        residual = residual + self.dropout2(hidden_states)
+
+        hidden_states = self.norm_mlp(residual)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual

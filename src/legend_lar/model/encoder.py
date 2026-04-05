@@ -86,7 +86,7 @@ class LArEncoder(nn.Module):
         start_pos = torch.cumsum(exp_sizes, dim=0) - exp_sizes # (N,)
 
         total_new_tokens = int(exp_sizes.sum().item())
-        new_max_seqlen = int(1 + 3 * (max_seqlen - 1))
+        new_max_seqlen = int(max_seqlen + 2)
 
         # start positions of each sequence in the new packed layout
         orig_seq_starts = cu_seqlens[:-1].to(torch.long) # (B,)
@@ -95,7 +95,7 @@ class LArEncoder(nn.Module):
         new_cu_seqlens[-1] = total_new_tokens
 
         # positions in the new packed layout
-        cls_pos = start_pos[cls_mask] # (B,)
+        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
         triplet_base = start_pos[non_cls_mask] # (N_hits,)
 
         # materialize the new packed token tensor
@@ -106,10 +106,22 @@ class LArEncoder(nn.Module):
             dtype=dtype
         )  # (N_new, D)
 
-        tokens[cls_pos] = self.cls_token
-        tokens[triplet_base] = r_tokens
-        tokens[triplet_base + 1] = phi_tokens
-        tokens[triplet_base + 2] = z_tokens
+        # write cls tokens
+        cls_src = self.cls_token.unsqueeze(0).expand(cls_pos.numel(), -1)
+        tokens.index_copy_(0, cls_pos, cls_src)
+
+        # write all geometry triplets
+        triplet_idx = torch.stack(
+            (triplet_base, triplet_base + 1, triplet_base + 2),
+            dim=1
+        ).reshape(-1) # (3 * N_hits,)
+
+        triplet_src = torch.stack(
+            (r_tokens, phi_tokens, z_tokens),
+            dim=1
+        ).reshape(-1, self.config.hidden_size) # (3 * N_hits, D)
+
+        tokens.index_copy_(0, triplet_idx, triplet_src)
         tokens = tokens.contiguous()
 
         residual = None
@@ -122,7 +134,6 @@ class LArEncoder(nn.Module):
             )
 
         # CLS pooling: first token in each packed sequence
-        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
         tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
         tokens = self.proj_out(tokens)
 
@@ -240,20 +251,32 @@ class HPGeEncoder(nn.Module):
         ) # (N_new, D)
 
         # cls token
-        tokens[start_pos[cls_mask]] = self.cls_token
+        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
+        cls_src = self.cls_token.unsqueeze(0).expand(cls_pos.numel(), -1)
+        tokens.index_copy_(0, cls_pos, cls_src)
 
         # gid -> 3 coordinate tokens
-        gid_start = start_pos[gid_mask]
-        tokens[gid_start] = r_tokens
-        tokens[gid_start + 1] = phi_tokens
-        tokens[gid_start + 2] = z_tokens
+        gid_start = start_pos[gid_mask] # (N_gid,)
+        gid_idx = torch.stack(
+            (gid_start, gid_start + 1, gid_start + 2),
+            dim=1
+        ).reshape(-1) # (3 * N_gid,)
+
+        gid_src = torch.stack(
+            (r_tokens, phi_tokens, z_tokens),
+            dim=1
+        ).reshape(-1, self.config.hidden_size) # (3 * N_gid, D)
+
+        tokens.index_copy_(0, gid_idx, gid_src)
 
         # partitioning tokens
         if self.config.subpartition_hpge_feats == 1:
-            tokens[start_pos[pid_mask]] = partitioning_emb
+            pid_pos = start_pos[pid_mask]
+            tokens.index_copy_(0, pid_pos, partitioning_emb)
 
         # feature tokens
-        tokens[start_pos[feat_mask]] = feat_emb
+        feat_pos = start_pos[feat_mask]
+        tokens.index_copy_(0, feat_pos, feat_emb)
 
         tokens = tokens.contiguous()
 
@@ -267,7 +290,6 @@ class HPGeEncoder(nn.Module):
             )
         
         # CLS pooling: first token in each packed sequence
-        cls_pos = new_cu_seqlens[:-1].to(torch.long) # (B,)
         tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
         tokens = self.proj_out(tokens)
 
