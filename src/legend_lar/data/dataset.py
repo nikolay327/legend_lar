@@ -45,7 +45,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         global_rng_seed_for_sampling: int = None,
         num_folds: int = None,
         num_bootstraps_per_fold: int = None,
-        sg_train_val: list[float] = None,
         mode: mp.Value = None, # can be an int when mode == 3 (evaluation mode)
         fold_id: mp.Value = None,
         bootstrap_id: mp.Value = None,
@@ -59,7 +58,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.num_folds = num_folds # == K
         self.num_bootstraps_per_fold = num_bootstraps_per_fold
         
-        self.sg_train_val = sg_train_val
         self.rng_seed_for_split = rng_seed_for_split
         self.times_of_mixing = times_of_mixing
         self.bootstrap_rng_seed = bootstrap_rng_seed
@@ -162,7 +160,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         if mode_value in (0, 1):
             assert len(self.data_lengths) == 2
             # label 0 data (sg / RC dataset) is treated to have 1 fold
-            sg_data_cumsum = self._get_data_chunks_cumsum(int(self.data_lengths[0]), self.sg_train_val)
+            sg_data_cumsum = self._get_data_chunks_cumsum(int(self.data_lengths[0]), [1.0, 0.0])
             # label 1 data with k folds (bg / physics)
             permuted_indices = np.array(self.mixed_indices[1], dtype=np.int64)
             num_data_within_folds = len(permuted_indices) // self.num_folds

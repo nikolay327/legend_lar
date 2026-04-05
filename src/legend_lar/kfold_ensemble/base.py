@@ -91,7 +91,6 @@ class TrainerBase(ABC):
             global_rng_seed_for_sampling=self.rng_seed_for_data_sampling,
             num_folds=self.config.num_folds,
             num_bootstraps_per_fold=self.config.num_bootstraps_per_fold,
-            sg_train_val=self.config.sg_train_val,
             mode=self.mode_value,
             fold_id=self.fid_value,
             bootstrap_id=self.bid_value,

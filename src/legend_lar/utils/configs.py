@@ -62,7 +62,6 @@ class NRECConfig:
 
     # Training hyperparams
     local_batch_size: int = None
-    sg_train_val: list[float] = None
     times_of_mixing: int = None
 
     lr_model: float = None
