@@ -465,7 +465,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
 
 post_attn_mlp.register_autograd(_post_backward, setup_context=_post_setup_context)
 
-class Block(nn.Module):
+class Block_(nn.Module):
     def __init__(
         self,
         emb_dim,
@@ -474,7 +474,7 @@ class Block(nn.Module):
         resid_dropout1,
         resid_dropout2
     ):
-        super(Block, self).__init__()
+        super(Block_, self).__init__()
 
         self.mixer = mixer_cls(emb_dim)
         self.mlp = mlp_cls(emb_dim)
@@ -559,7 +559,7 @@ class Block(nn.Module):
         return out, residual2
 
 # euqivalent implementation
-class Block_(nn.Module):
+class Block(nn.Module):
     def __init__(
         self,
         emb_dim,
@@ -568,7 +568,7 @@ class Block_(nn.Module):
         resid_dropout1,
         resid_dropout2
     ):
-        super(Block_, self).__init__()
+        super(Block, self).__init__()
         
         self.mixer = mixer_cls(emb_dim)
         self.mlp = mlp_cls(emb_dim)

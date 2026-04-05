@@ -86,7 +86,7 @@ class LArEncoder(nn.Module):
         start_pos = torch.cumsum(exp_sizes, dim=0) - exp_sizes # (N,)
 
         total_new_tokens = int(exp_sizes.sum().item())
-        new_max_seqlen = int(max_seqlen + 2)
+        new_max_seqlen = int(3 * max_seqlen - 2)
 
         # start positions of each sequence in the new packed layout
         orig_seq_starts = cu_seqlens[:-1].to(torch.long) # (B,)
@@ -124,14 +124,15 @@ class LArEncoder(nn.Module):
         tokens.index_copy_(0, triplet_idx, triplet_src)
         tokens = tokens.contiguous()
 
-        residual = None
-        for block in self.blocks:
-            tokens, residual = block(
-                hidden_states=tokens,
-                residual=residual,
-                cu_seqlens=new_cu_seqlens,
-                max_seqlen=new_max_seqlen
-            )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            residual = None
+            for block in self.blocks:
+                tokens, residual = block(
+                    hidden_states=tokens,
+                    residual=residual,
+                    cu_seqlens=new_cu_seqlens.to(torch.int32),
+                    max_seqlen=new_max_seqlen
+                )
 
         # CLS pooling: first token in each packed sequence
         tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
@@ -280,14 +281,15 @@ class HPGeEncoder(nn.Module):
 
         tokens = tokens.contiguous()
 
-        residual = None
-        for block in self.blocks:
-            tokens, residual = block(
-                hidden_states=tokens,
-                residual=residual,
-                cu_seqlens=new_cu_seqlens,
-                max_seqlen=new_max_seqlen
-            )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            residual = None
+            for block in self.blocks:
+                tokens, residual = block(
+                    hidden_states=tokens,
+                    residual=residual,
+                    cu_seqlens=new_cu_seqlens.to(torch.int32),
+                    max_seqlen=new_max_seqlen
+                )
         
         # CLS pooling: first token in each packed sequence
         tokens = self.norm(residual[cls_pos].float() + tokens[cls_pos].float()) # (B, D)
