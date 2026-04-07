@@ -198,7 +198,7 @@ class TrainerBase(ABC):
         self.model.eval()
         self.val_epoch()
 
-        print(f"Epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")
+        print(f"fid {fid}, bid {bid}, epoch {epoch} | Train Loss: {self.train_loss[-1]:.6f}, Val Loss: {self.val_loss[-1]:.6f}")
 
         delta_loss = self.best_val_loss - self.val_loss[-1]
         min_delta = self.config.rel_tolerance * self.best_val_loss
