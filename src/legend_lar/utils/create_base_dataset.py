@@ -24,6 +24,7 @@ def create_base_dataset(
         file_db.build_file(
             tier="training",
             partition="p16",
+            version="base",
             filename="geds_data_phy.npy"
         ), geds_data_phy
     )
@@ -39,6 +40,7 @@ def create_base_dataset(
         file_db.build_file(
             tier="training",
             partition="p16",
+            version="base",
             filename="sipm_data_sparse_phy.npz"
         )
     )
@@ -61,6 +63,7 @@ def create_base_dataset(
     path = file_db.build_file(
         tier="inference_dataset",
         partition="p16",
+        version="base",
         filename="sipm_data_sparse_rc_ev_ep.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_calibration[: data_config["num_calib_data"]])
@@ -68,6 +71,7 @@ def create_base_dataset(
     path = file_db.build_file(
         tier="inference_dataset",
         partition="p16",
+        version="base",
         filename="sipm_data_sparse_glob.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_calibration[data_config["num_calib_data"]:])
@@ -86,6 +90,7 @@ def create_base_dataset(
     path = file_db.build_file(
         tier="training",
         partition="p16",
+        version="base",
         filename="sipm_data_sparse_rc.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_rc)

@@ -243,6 +243,7 @@ def train(
     partition: str,
     model_name: str,
     version: str,
+    train_dataset_version: str,
     dataflow_dir: str,
     base_cfg_name: str,
     tmp_dir: str
@@ -275,6 +276,7 @@ def train(
     hpge_dataset = file_db.build_file(
         tier="training",
         partition=partition,
+        version=train_dataset_version,
         filename=data_config["hpge_dataset"]
     )
     # load into RAM
@@ -287,6 +289,7 @@ def train(
         file_db.build_file(
         tier="training",
         partition=partition,
+        version=train_dataset_version,
         filename=data_config["lar_datasets"][i]
     ) for i in range(2)
     ]
@@ -352,6 +355,7 @@ if __name__ == "__main__":
     parser.add_argument("partition", type=str, help="partition name")
     parser.add_argument("model_name", type=str, help="Name of the model")
     parser.add_argument("version", type=str, help="Model version")
+    parser.add_argument("train_dataset_version", type=str, help="Traning dataset version")
     parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
     parser.add_argument("base_cfg_name", type=str, help="Name of the base json config")
     parser.add_argument("tmp_dir", type=str, help="Directory for storing temporary files")
@@ -378,6 +382,7 @@ if __name__ == "__main__":
         args.partition,
         args.model_name,
         args.version,
+        args.train_dataset_version,
         args.dataflow_dir,
         args.base_cfg_name,
         args.tmp_dir
