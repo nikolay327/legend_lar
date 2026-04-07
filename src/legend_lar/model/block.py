@@ -243,7 +243,7 @@ def _pre_backward(ctx, grad_qkv, grad_residual1, *unused_aux_grads):
     grad_residual1_total = grad_residual1.float() + grad_residual1_from_ln
 
     grad_hidden = _dropout_bwd(
-        grad_residual1_total.to(torch.bfloat16),
+        grad_residual1_total,
         mask1,
         ctx.resid_dropout_p,
         ctx.training,
@@ -434,7 +434,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
 
     grad_residual1 = grad_residual2_total
     grad_attn_proj = _dropout_bwd(
-        grad_residual2_total.to(torch.bfloat16),
+        grad_residual2_total,
         mask2,
         ctx.resid_dropout_p,
         ctx.training
@@ -442,7 +442,7 @@ def _post_backward(ctx, grad_out, grad_residual2, *unused_aux_grads):
 
     out_proj_weight_bf16 = _to_bf16(out_proj_weight)
     grad_attn_out, grad_outproj_w, grad_outproj_b = _linear_bwd(
-        grad_attn_proj,
+        grad_attn_proj.to(torch.bfloat16),
         _to_bf16(attn_out),
         out_proj_weight_bf16
     )

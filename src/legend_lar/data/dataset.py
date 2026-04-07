@@ -25,9 +25,11 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
               The data loaded in the evaluation mode is from test_folds arg, while in the calibration mode, the data is shuffled,
               and then partitioned using calib_partitioning_nums arg.
               This means:
-                - use eval mode for loading phys data during calibration
+                - use calib mode for loading phys data during calibration
                 - use calib mode for loading FT data used for calibration
                 - use eval mode for loading FT data used for coverage test
+                - use eval mode for loading any data that do not need special index handling via self.test_folds
+                NOTE: in both eval and calib modes, the inclusion of hpge data is optional (can be set to None)
     """
     def __init__(
         self,
@@ -37,14 +39,12 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         batch_size: int,
         hpge_feats_mean: list[float] = None,
         hpge_feats_std: list[float] = None,
-        calib_partitioning_nums: list[int] = None,
         test_folds: list[list[int]] = None,
         rng_seed_for_split: int = None,
         times_of_mixing: int = 5,
         bootstrap_rng_seed: int = None,
         global_rng_seed_for_sampling: int = None,
         num_folds: int = None,
-        num_bootstraps_per_fold: int = None,
         mode: mp.Value = None, # can be an int when mode == 3 (evaluation mode)
         fold_id: mp.Value = None,
         bootstrap_id: mp.Value = None,
@@ -56,7 +56,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         super(ParallelBootstrappedKFoldLArListDataset, self).__init__()
 
         self.num_folds = num_folds # == K
-        self.num_bootstraps_per_fold = num_bootstraps_per_fold
         
         self.rng_seed_for_split = rng_seed_for_split
         self.times_of_mixing = times_of_mixing
@@ -68,7 +67,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.hpge_feats_std = hpge_feats_std
 
         self.test_folds = test_folds # needed in evaluation mode
-        self.calib_partitioning_nums = calib_partitioning_nums # needed in calibration mode
 
         assert batch_size % 2 == 0
         self.batch_size = batch_size
@@ -193,9 +191,13 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                 }
             }
         elif mode_value == 2:
-            self.indices = self.test_folds[int(self.fold_id.value)]
+            self.indices = [
+                np.array(self.test_folds[int(self.fold_id.value)]).astype(np.float32)
+            ]
         else:
-            self.indices = np.arange(int(np.array(self.data_lengths, dtype=np.int64)[0]), dtype=np.int64).tolist()
+            self.indices = [
+                np.arange(int(self.data_lengths[i])).astype(np.float32) for i in range(len(self.data_lengths))
+            ]
 
     def _set_sg_and_bg_datasets(self):
         assert get_worker_info() is not None, "Can only be called by each worker inside worker_init"
@@ -278,9 +280,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                 self.current_bg_val[self.sampling_rng.permutation(len(self.current_bg_val))].astype(np.float32)
             ]
         else:
-            self.current_indices = [
-                np.array(self.indices).astype(np.float32)
-            ]
+            self.current_indices = self.indices
 
         current_indices = []
         for i in range(len(self.current_indices)):
@@ -294,7 +294,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                     last_batch = np.zeros(batch_size)
                     last_batch[:last_batch_len] = indices[-last_batch_len:]
                     last_batch[last_batch_len:] = np.nan
-                    # the nan entries will be handled in the collate_fn
+                    # the nan entries will be handled in LArDatasetBase __getitem__
 
             indices = indices[:batch_size * (len(indices) // batch_size)] # drop the last incomplete batch
             if last_batch is not None:
@@ -322,12 +322,12 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
             batch = np.concatenate(batch, axis=0) if len(batch) > 1 else batch[0]
             if mode_value in (0, 1):
-                gE = self.hpge_dataset[indices[1]]
+                gE = self.hpge_dataset[indices[-1]]
             else:
                 if self.hpge_dataset is not None:
-                    gE = self.hpge_dataset[indices[0]]
+                    gE = self.hpge_dataset[indices[-1]]
                 else:
-                    gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 2), dtype=np.float32)
+                    gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 1), dtype=np.float32)
             indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
             yield batch, gE, indices
 

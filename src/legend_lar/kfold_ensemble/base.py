@@ -90,7 +90,6 @@ class TrainerBase(ABC):
             bootstrap_rng_seed=self.rng_seed_for_bootstrap,
             global_rng_seed_for_sampling=self.rng_seed_for_data_sampling,
             num_folds=self.config.num_folds,
-            num_bootstraps_per_fold=self.config.num_bootstraps_per_fold,
             mode=self.mode_value,
             fold_id=self.fid_value,
             bootstrap_id=self.bid_value,
@@ -130,7 +129,9 @@ class TrainerBase(ABC):
                 )
                 os.makedirs(os.path.dirname(fold_path), exist_ok=True)
                 np.save(fold_path, fold_indices)
-        torch.distributed.barrier()
+
+        if self.world_size > 1:
+            torch.distributed.barrier()
 
     def _set_model_initializer(self):
         self.model_initiator = InitRNG(

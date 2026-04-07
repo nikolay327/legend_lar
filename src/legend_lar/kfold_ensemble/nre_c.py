@@ -12,7 +12,11 @@ cfg.autotune_local_cache = False
 
 from torch import Tensor
 import torch.nn.functional as F
-from apex.optimizers import FusedMixedPrecisionLamb
+
+try:
+    from apex.optimizers import FusedMixedPrecisionLamb
+except ImportError:
+    from bitsandbytes.optim import LAMB as FusedMixedPrecisionLamb
 
 from legend_lar.model import NREC
 from legend_lar.utils import FileDB, NRECConfig, _initialize_configs, _init_torch, decode_geom

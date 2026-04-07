@@ -30,6 +30,7 @@ def _init_torch():
 
     torch.cuda.set_device(device)
 
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device, init_method="env://")
+    if world_size > 1:
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device, init_method="env://")
 
     return local_rank, rank, world_size, device
