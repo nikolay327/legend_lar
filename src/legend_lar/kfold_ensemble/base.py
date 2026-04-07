@@ -227,6 +227,7 @@ class TrainerBase(ABC):
         if start_from_epoch == 1:
             print(f'fid_{fid}, bid_{bid} training started')
         else:
+            self.last_saved_epoch = start_from_epoch - 1
             print(f'fid_{fid}, bid_{bid} training continued')
 
         for epoch in range(start_from_epoch, self.config.max_epochs+1):

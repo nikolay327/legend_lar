@@ -331,7 +331,7 @@ def train(
             meta = np.array(meta).astype(int)
             global_id = model_cfg.num_folds * meta[0] + meta[1]
             if meta[-1] != 1:
-                to_be_trained[global_id, -1] = meta[-1]
+                to_be_trained[global_id, -1] = meta[-1] + 1
         elif len(meta) == 4:
             meta = np.array(meta[:3]).astype(int)
             global_id = model_cfg.num_folds * meta[0] + meta[1]
