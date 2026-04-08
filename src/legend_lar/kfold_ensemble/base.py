@@ -108,30 +108,25 @@ class TrainerBase(ABC):
             dataset=self.dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=8,
+            num_workers=16,
             pin_memory=False,
-            prefetch_factor=4,
+            prefetch_factor=2,
             persistent_workers=True,
             worker_init_fn=worker_init_fn,
             collate_fn=self.collate_fn
         )
 
-        if self.rank == 0:
-            k_fold = self.dataset.indices["bg"]["test_folds"]
-            for fid in range(self.config.num_folds):
-                fold_indices = np.array(k_fold['fold_{i}'.format(i=fid)], dtype=np.int64)
-                fold_path = self.file_db.build_file(
-                    tier="fold_ids",
-                    partition=self.partition,
-                    model_name=self.model_name,
-                    version=self.version,
-                    fid=fid
-                )
-                os.makedirs(os.path.dirname(fold_path), exist_ok=True)
-                np.save(fold_path, fold_indices)
-
-        if self.world_size > 1:
-            torch.distributed.barrier()
+    def _write_fold_k_indices(self, fid: int):
+        fold_indices = np.array(self.dataset.indices["bg"]["test_folds"]['fold_{i}'.format(i=fid)], dtype=np.int64)
+        fold_path = self.file_db.build_file(
+            tier="fold_ids",
+            partition=self.partition,
+            model_name=self.model_name,
+            version=self.version,
+            fid=fid
+        )
+        os.makedirs(os.path.dirname(fold_path), exist_ok=True)
+        np.save(fold_path, fold_indices)
 
     def _set_model_initializer(self):
         self.model_initiator = InitRNG(
@@ -220,7 +215,7 @@ class TrainerBase(ABC):
         self.current_fid = fid
         self.current_bid = bid
 
-        self.dataloader.dataset.set_fold_id(fid)
+        self.dataloader.dataset.set_fold_id(bid)
         self.dataloader.dataset.set_bootstrap_id(bid)
         self.reset_model_and_optimizer(fid, bid, start_from_epoch)
 
@@ -246,4 +241,6 @@ class TrainerBase(ABC):
 
     def train(self, to_be_trained: List[List[int]]):
         for fid, bid, start_from_epoch in to_be_trained:
+            if bid == 0:
+                self._write_fold_k_indices(fid)
             self.train_one_model(fid, bid, start_from_epoch)

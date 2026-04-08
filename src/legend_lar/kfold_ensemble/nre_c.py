@@ -83,7 +83,7 @@ class NRECTrainer(TrainerBase):
         self._reinit_model(fid, bid)
 
         if start_from_epoch == 1:
-            self.model = torch.compile(self.model, dynamic=True)
+            # self.model = torch.compile(self.model)
             self._init_optimizer()
             torch.cuda.empty_cache()
             return
@@ -113,7 +113,7 @@ class NRECTrainer(TrainerBase):
             self.last_saved_epoch = last_epoch
 
         self.model.load_state_dict(clean_state_dict(cp["model"]), strict=True)
-        self.model = torch.compile(self.model, dynamic=True)
+        # self.model = torch.compile(self.model)
 
         self._init_optimizer(cp["model_opt"])
 
@@ -248,7 +248,7 @@ def train(
     base_cfg_name: str,
     tmp_dir: str
 ):
-    local_rank, rank, world_size, device = _init_torch()
+    rank, world_size, device = _init_torch()
 
     file_db = FileDB(
         working_dir=dataflow_dir,
@@ -329,13 +329,13 @@ def train(
         meta = path.split("_")
         if len(meta) == 3:
             meta = np.array(meta).astype(int)
-            global_id = model_cfg.num_folds * meta[0] + meta[1]
+            global_id = model_cfg.num_bootstraps_per_fold * meta[0] + meta[1]
             if meta[-1] != 1:
                 to_be_trained[global_id, -1] = meta[-1] + 1
         elif len(meta) == 4:
             meta = np.array(meta[:3]).astype(int)
-            global_id = model_cfg.num_folds * meta[0] + meta[1]
-            remove_id.append(remove_id)
+            global_id = model_cfg.num_bootstraps_per_fold * meta[0] + meta[1]
+            remove_id.append(global_id)
 
     to_be_trained = np.delete(to_be_trained, remove_id, axis=0)
     to_be_trained = to_be_trained.astype(int).tolist()

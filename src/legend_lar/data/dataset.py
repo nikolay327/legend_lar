@@ -1,5 +1,5 @@
 import math
-import multiprocessing as mp
+import torch.multiprocessing as mp
 
 from torch.utils.data import IterableDataset, get_worker_info
 

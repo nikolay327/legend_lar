@@ -85,7 +85,8 @@ class LArEncoder(nn.Module):
         new_tokens.index_copy_(0, cls_pos, cls_src)
 
         # write the rest of the tokens
-        new_tokens[non_cls_mask] = tokens
+        non_cls_pos = non_cls_mask.nonzero(as_tuple=False).squeeze(-1)
+        new_tokens.index_copy_(0, non_cls_pos, tokens)
 
         new_tokens = new_tokens.contiguous()
 
@@ -197,14 +198,17 @@ class HPGeEncoder(nn.Module):
         tokens.index_copy_(0, cls_pos, cls_src)
 
         # gid token
-        tokens[gid_mask] = geom_tokens
+        gid_pos = gid_mask.nonzero(as_tuple=False).squeeze(-1)
+        tokens.index_copy_(0, gid_pos, geom_tokens)
 
         # partitioning tokens
         if self.config.subpartition_hpge_feats == 1:
-            tokens[pid_mask] = partitioning_emb
+            pid_pos = pid_mask.nonzero(as_tuple=False).squeeze(-1)
+            tokens.index_copy_(0, pid_pos, partitioning_emb)
 
         # feature tokens
-        tokens[feat_mask] = feat_emb
+        feat_pos = feat_mask.nonzero(as_tuple=False).squeeze(-1)
+        tokens.index_copy_(0, feat_pos, feat_emb)
 
         tokens = tokens.contiguous()
 
