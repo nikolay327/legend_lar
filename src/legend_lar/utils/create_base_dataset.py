@@ -1,3 +1,4 @@
+import os
 import shutil
 import numpy as np
 import scipy as sp
@@ -20,14 +21,14 @@ def create_base_dataset(
 
     geds_data_phy = lh5.read_as("/geds", geds_data_phy, field_mask=["id", "energy", "drift_time", "aoe", "lq"], library="pd")
     geds_data_phy = geds_data_phy[["id", "energy", "drift_time", "aoe", "lq"]].to_numpy().astype(np.float32)
-    np.save(
-        file_db.build_file(
-            tier="training",
-            partition="p16",
-            version="base",
-            filename="geds_data_phy.npy"
-        ), geds_data_phy
+    path = file_db.build_file(
+        tier="training",
+        partition="p16",
+        version="base",
+        filename="geds_data_phy.npy"
     )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.save(path, geds_data_phy)
     geds_data_phy = None
 
     sipm_data_sparse_phy = file_db.build_file(
@@ -45,6 +46,24 @@ def create_base_dataset(
         )
     )
 
+    path = file_db.build_file(
+        tier="dataset",
+        partition="p16",
+        filename="lib_phy.lh5"
+    )
+    phy_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
+    mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
+    mask = (mask > 0) & (mask < 100)
+    phy_classical_classifier = phy_classical_classifier[mask]
+    np.save(
+        file_db.build_file(
+            tier="training",
+            partition="p16",
+            version="base",
+            filename="classical_classifier_phy.npy"
+        ), phy_classical_classifier
+    )
+
     # sg training and calibration data
     rng = np.random.default_rng(seed=data_config["rng_seed_calib_selection"])
     sipm_data_sparse_fp = file_db.build_file(
@@ -57,16 +76,44 @@ def create_base_dataset(
 
     calibration_indices = indices[: 2 * data_config["num_calib_data"]] # factor 2 because of additional global calibration
     training_indices = indices[2 * data_config["num_calib_data"]: ]
+
+    path = file_db.build_file(
+        tier="dataset",
+        partition="p16",
+        filename="lib_rc_fp.lh5"
+    )
+    sipm_fp_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
+    mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
+    mask = (mask > 0) & (mask < 100)
+    sipm_fp_classical_classifier = sipm_fp_classical_classifier[mask]
     
     # calibration
     sipm_data_sparse_calibration = sipm_data_sparse_fp[calibration_indices]
+    sipm_data_sparse_calibration_classical_classifier = sipm_fp_classical_classifier[calibration_indices]
     path = file_db.build_file(
         tier="inference_dataset",
         partition="p16",
         version="base",
         filename="sipm_data_sparse_rc_ev_ep.npz"
     )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     sp.sparse.save_npz(path, sipm_data_sparse_calibration[: data_config["num_calib_data"]])
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="classical_classifier_rc_ev_ep.npy"
+        ), sipm_data_sparse_calibration_classical_classifier[: data_config["num_calib_data"]]
+    )
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="indices_rc_ev_ep.npy"
+        ), calibration_indices[: data_config["num_calib_data"]]
+    )
 
     path = file_db.build_file(
         tier="inference_dataset",
@@ -75,9 +122,26 @@ def create_base_dataset(
         filename="sipm_data_sparse_glob.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_calibration[data_config["num_calib_data"]:])
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="classical_classifier_glob.npy"
+        ), sipm_data_sparse_calibration_classical_classifier[data_config["num_calib_data"]:]
+    )
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="indices_glob.npy"
+        ), calibration_indices[data_config["num_calib_data"]:]
+    )
 
     # training
     sipm_data_sparse_fp = sipm_data_sparse_fp[training_indices]
+    sipm_fp_classical_classifier = sipm_fp_classical_classifier[training_indices]
     # include rc from ge trigger
     sipm_data_sparse_ge = file_db.build_file(
         tier="dataset",
@@ -94,6 +158,34 @@ def create_base_dataset(
         filename="sipm_data_sparse_rc.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_rc)
+
+    path = file_db.build_file(
+        tier="dataset",
+        partition="p16",
+        filename="lib_rc_ge.lh5"
+    )
+    sipm_rc_ge_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
+    mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
+    mask = (mask > 0) & (mask < 100)
+    sipm_rc_ge_classical_classifier = sipm_rc_ge_classical_classifier[mask]
+
+    sipm_rc_classical_classifier = np.concatenate([sipm_fp_classical_classifier, sipm_rc_ge_classical_classifier], axis=0)
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="classical_classifier_rc.npy"
+        ), sipm_rc_classical_classifier
+    )
+    np.save(
+        file_db.build_file(
+            tier="inference_dataset",
+            partition="p16",
+            version="base",
+            filename="indices_rc.npy"
+        ), training_indices
+    )
 
 if __name__ == "__main__":
     import argparse
