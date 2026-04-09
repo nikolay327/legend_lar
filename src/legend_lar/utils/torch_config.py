@@ -1,8 +1,9 @@
 import os
+from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-def _init_torch():
+def _init_torch(cache_dir=None):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.enable_math_sdp(False)
@@ -21,5 +22,15 @@ def _init_torch():
     if mp.get_start_method(allow_none=True) != "spawn":
         mp.set_start_method("spawn", force=True)
     device = torch.device("cuda:0") # is always 0 due to gpu-bind
+
+    if cache_dir is not None:
+        BASE = cache_dir
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{BASE}/inductor")
+        os.environ.setdefault("TRITON_CACHE_DIR", f"{BASE}/triton/rank_{rank}")
+        os.environ.setdefault("NUMBA_CACHE_DIR", f"{BASE}/numba/rank_{rank}")
+
+        Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
 
     return rank, world_size, device

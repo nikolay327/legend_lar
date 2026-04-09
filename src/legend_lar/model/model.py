@@ -38,14 +38,14 @@ class NREC(nn.Module):
 
     def forward(
         self,
-        f_idx: Tensor, # (N_valid,)
-        f_vals: Tensor, # (N_valid,)
-        ge_cu_seqlens: Tensor, # (B/2+1,)
-        ge_max_seqlen: int,
         t_idx: Tensor, # (N,)
         s_idx: Tensor, # (N,)
         cu_seqlens: Tensor, # (B+1,)
-        max_seqlen: int
+        max_seqlen: int,
+        f_idx: Tensor = None, # (N_valid,)
+        f_vals: Tensor = None, # (N_valid,)
+        ge_cu_seqlens: Tensor = None, # (B/2+1,)
+        ge_max_seqlen: int = None
     ):
         e_lar = self.lar_encoder(
             t_idx=t_idx,
@@ -55,12 +55,15 @@ class NREC(nn.Module):
             geom_tokenizer=self.geom_tokenizer
         ) # (B, D)
 
-        e_hpge = self.hpge_encoder(
-            f_idx=f_idx,
-            f_vals=f_vals,
-            cu_seqlens=ge_cu_seqlens,
-            max_seqlen=ge_max_seqlen,
-            geom_tokenizer=self.geom_tokenizer
-        ) # (B/2, D)
+        if ge_cu_seqlens is None:
+            e_hpge = None
+        else:
+            e_hpge = self.hpge_encoder(
+                f_idx=f_idx,
+                f_vals=f_vals,
+                cu_seqlens=ge_cu_seqlens,
+                max_seqlen=ge_max_seqlen,
+                geom_tokenizer=self.geom_tokenizer
+            ) # (B/2, D)
 
         return e_lar, e_hpge

@@ -157,14 +157,14 @@ class NRECTrainer(TrainerBase):
         max_seqlen: int
     ):
         e_lar, e_hpge = self.model(
-            f_idx=f_idx,
-            f_vals=f_vals,
-            ge_cu_seqlens=ge_cu_seqlens,
-            ge_max_seqlen=ge_max_seqlen,
             t_idx=t_idx,
             s_idx=s_idx,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
+            max_seqlen=max_seqlen,
+            f_idx=f_idx,
+            f_vals=f_vals,
+            ge_cu_seqlens=ge_cu_seqlens,
+            ge_max_seqlen=ge_max_seqlen
         )
         e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
         e_hpge = F.normalize(e_hpge, p=2, dim=-1) # (B / 2, D)
@@ -246,9 +246,10 @@ def train(
     train_dataset_version: str,
     dataflow_dir: str,
     base_cfg_name: str,
-    tmp_dir: str
+    tmp_dir: str,
+    cache_dir: str
 ):
-    rank, world_size, device = _init_torch()
+    rank, world_size, device = _init_torch(cache_dir)
 
     file_db = FileDB(
         working_dir=dataflow_dir,
@@ -362,21 +363,6 @@ if __name__ == "__main__":
     parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
     args = parser.parse_args()
 
-    import os
-    from pathlib import Path
-
-    BASE = args.cache_dir
-    rank = os.environ["RANK"]
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{BASE}/inductor")
-    os.environ.setdefault("TRITON_CACHE_DIR", f"{BASE}/triton/rank_{rank}")
-    os.environ.setdefault("NUMBA_CACHE_DIR", f"{BASE}/numba/rank_{rank}")
-
-    Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-
-    JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
-
     train(
         args.experiment,
         args.partition,
@@ -385,5 +371,6 @@ if __name__ == "__main__":
         args.train_dataset_version,
         args.dataflow_dir,
         args.base_cfg_name,
-        args.tmp_dir
+        args.tmp_dir,
+        args.cache_dir
     )

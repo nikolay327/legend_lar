@@ -1,126 +1,238 @@
 import os
-import json
-import random
 import math
-from pathlib import Path
+
+from typing import List
 
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
-from torch.amp import autocast
 
 import numpy as np
+from numpy.lib.format import open_memmap
+import scipy
 
-from legend_lar.utils import BootstrappedKFoldConfig, EvalConfig, _initialize_configs, _init_torch
-from legend_lar.model import ContrastiveRatioEstimator
-from legend_lar.data import BootstrappedKFoldLArListDataset, CollateFn, KFoldBootstrap_worker_init_fn
+from functools import partial
+
+from legend_lar.model import NREC
+from legend_lar.utils import NRECConfig, _initialize_configs, decode_geom, _init_torch, FileDB
+from legend_lar.data import ParallelBootstrappedKFoldLArListDataset, ParallelKFoldBootstrap_worker_init_fn, NRECCollateFn
 
 from lgdo import Table, Array, lh5
 
-class Evaluator:
+class NRECCalibrator:
     def __init__(
         self,
-        config: BootstrappedKFoldConfig,
-        eval_config: EvalConfig,
-        model_dir: str,
-        data_dir: Path,
-        save_to: str,
+        file_db: FileDB,
+        partition: str,
+        model_name: str,
+        version: str,
+        dataset_version: str,
+        batch_size: int,
         device: str | int
     ):
         self.device = device
-        self.config = config
-        self.eval_config = eval_config
 
-        self.BASE_SEED = self.config.rng_seed
-        self.BASE_RNG = random.Random(self.BASE_SEED)
+        self.file_db = file_db
+        self.partition = partition
+        self.model_name = model_name
+        self.version = version
+        self.dataset_version = dataset_version
+        self.batch_size = batch_size
 
-        self.rng_seed_for_data_plit = self.BASE_RNG.getrandbits(64)
-        self.rng_seed_for_bootstrap = self.BASE_RNG.getrandbits(64)
-        self.rng_seed_for_data_sampling = self.BASE_RNG.getrandbits(64)
+        model_cfg, data_config = _initialize_configs(
+            config_obj=NRECConfig(),
+            config_path=file_db.build_file(
+                tier="model_config",
+                partition=partition,
+                model_name=model_name,
+                version=version
+            )
+        )
 
-        self.fid_value = mp.Value("i", 0)
+        self.config = model_cfg
+        self.data_config = data_config
 
-        self.null_anchor_buffer: Tensor = None # stored on GPU
-        self.null_val_anchor_buffer: Tensor = None # stored on GPU
-        self.model_dir = model_dir
-        self.save_to = save_to
+        self.inv_temp = 1 / self.config.temperature
+        self.ev_ep_null_buffer: List[Tensor] = None # stored on GPU
+        self.glob_null_buffer: List[Tensor] = None # stored on GPU
+        self.classical_classifier_glob_buffer = None
 
-        self._init_cal_dataloader()
         self._init_phy_dataloader()
-
-        self.phy_4by4 = np.load(str(data_dir / self.eval_config.phy_4by4_data) + '.npy').astype(bool)
-        self.cal_4by4 = np.load(str(data_dir / self.eval_config.fc_4by4_data) + '.npy').astype(bool)
+        self._init_ev_ep_null_dataloader()
+        self._init_glob_null_dataloader()
 
     def _init_phy_dataloader(self):
-        test_folds = [np.load(f'{self.model_dir}/fid_{i}/fold_indices.npy').astype(np.float64).tolist() for i in range(self.config.num_folds)]
-        self.phy_dataset = BootstrappedKFoldLArListDataset(
-            lar_paths=self.config.data_paths,
+        test_folds = [
+            np.load(
+                self.file_db.build_file(
+                    tier="fold_ids",
+                    partition=self.partition,
+                    model_name=self.model_name,
+                    version=self.version,
+                    fid=fid
+                )
+            ).astype(np.float64).tolist() for fid in range(self.config.num_folds)
+        ]
+
+        hpge_dataset = self.file_db.build_file(
+            tier="training",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename=self.data_config["hpge_dataset"]
+        )
+        # load into RAM
+        hpge_dataset = open_memmap(
+            filename=hpge_dataset,
+            mode="r"
+        ).copy()
+
+        lar_datasets = [
+            self.file_db.build_file(
+            tier="training",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename=self.data_config["lar_datasets"][i]
+        ) for i in range(2) if i==1
+        ]
+        lar_datasets = [scipy.sparse.load_npz(path) for path in lar_datasets]
+
+        self.fid_value = mp.Value("i", 0)
+        dataset = ParallelBootstrappedKFoldLArListDataset(
+            lar_data_lengths=[dataset.shape[0] for dataset in lar_datasets],
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
-            batch_size=self.config.local_batch_size,
-            labels=self.config.labels,
-            prior=self.config.prior,
-            hpge_path=self.config.hpge_id_and_energy,
-            hpge_energy_mean=self.config.hpge_energy_mean,
-            hpge_energy_std=self.config.hpge_energy_std,
+            batch_size=self.batch_size,
+            hpge_feats_mean=self.config.hpge_feats_mean,
+            hpge_feats_std=self.config.hpge_feats_std,
             test_folds=test_folds,
-            rng_seed_for_split=self.rng_seed_for_data_plit,
-            times_of_mixing=self.config.times_of_mixing,
-            sg_train_val_cal_test_frac=self.config.sg_train_val_cal_test_frac,
-            mode=4,
+            mode=2,
             fold_id=self.fid_value
         )
-        collate_fn = CollateFn(
-            num_sipm_chs=self.config.num_sipms,
+
+        collate_fn = NRECCollateFn(
+            cls_placeholder_id=self.config.cls_placeholder_id,
             cuda_device=self.device
         )
+        worker_init_fn = partial(
+            ParallelKFoldBootstrap_worker_init_fn,
+            hpge_dataset,
+            lar_datasets
+        )
         self.phy_dataloader = DataLoader(
-            dataset=self.phy_dataset,
+            dataset=dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=2,
+            num_workers=8,
             pin_memory=False,
-            prefetch_factor=4,
+            prefetch_factor=2,
             persistent_workers=True,
-            worker_init_fn=KFoldBootstrap_worker_init_fn,
+            worker_init_fn=worker_init_fn,
             collate_fn=collate_fn
         )
 
-    def _init_cal_dataloader(self):
-        self.cal_mode_value = mp.Value("i", 2)
-        self.cal_dataset = BootstrappedKFoldLArListDataset(
-            lar_paths=self.config.data_paths,
+        path = self.file_db.build_file(
+            tier="training",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename="classical_classifier_phy.npy"
+        )
+        self.classical_classifier_phy = np.load(path).astype(bool)
+
+    def _init_ev_ep_null_dataloader(self):
+        lar_dataset = self.file_db.build_file(
+            tier="inference_dataset",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename=self.data_config["ev_ep_null"]
+        )
+        lar_dataset = scipy.sparse.load_npz(lar_dataset)
+
+        dataset = ParallelBootstrappedKFoldLArListDataset(
+            lar_data_lengths=[lar_dataset.shape[0]],
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
-            batch_size=self.config.local_batch_size,
-            labels=self.config.labels,
-            prior=self.config.prior,
-            hpge_path=self.config.hpge_id_and_energy,
-            hpge_energy_mean=self.config.hpge_energy_mean,
-            hpge_energy_std=self.config.hpge_energy_std,
-            rng_seed_for_split=self.rng_seed_for_data_plit,
-            times_of_mixing=self.config.times_of_mixing,
-            num_folds=self.config.num_folds,
-            sg_train_val_cal_test_frac=self.config.sg_train_val_cal_test_frac,
-            mode=self.cal_mode_value
+            batch_size=self.batch_size,
+            hpge_feats_mean=self.config.hpge_feats_mean,
+            hpge_feats_std=self.config.hpge_feats_std,
+            mode=3
         )
-        collate_fn = CollateFn(
-            num_sipm_chs=self.config.num_sipms,
+        collate_fn = NRECCollateFn(
+            cls_placeholder_id=self.config.cls_placeholder_id,
             cuda_device=self.device
         )
-        self.cal_dataloader = DataLoader(
-            dataset=self.cal_dataset,
+        worker_init_fn = partial(
+            ParallelKFoldBootstrap_worker_init_fn,
+            None,
+            [lar_dataset]
+        )
+        self.ev_ep_null_dataloader = DataLoader(
+            dataset=dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=2,
+            num_workers=8,
             pin_memory=False,
-            prefetch_factor=4,
+            prefetch_factor=2,
             persistent_workers=True,
-            worker_init_fn=KFoldBootstrap_worker_init_fn,
+            worker_init_fn=worker_init_fn,
             collate_fn=collate_fn
         )
+
+        path = self.file_db.build_file(
+            tier="inference_dataset",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename="classical_classifier_rc_ev_ep.npy"
+        )
+        self.classical_classifier_ev_ep = np.load(path).astype(bool)
+
+    def _init_glob_null_dataloader(self):
+        lar_dataset = self.file_db.build_file(
+            tier="inference_dataset",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename=self.data_config["glob_null"]
+        )
+        lar_dataset = scipy.sparse.load_npz(lar_dataset)
+
+        dataset = ParallelBootstrappedKFoldLArListDataset(
+            lar_data_lengths=[lar_dataset.shape[0]],
+            num_t_bins=self.config.num_sipm_t_bins,
+            num_sipm_chs=self.config.num_sipms,
+            batch_size=self.batch_size,
+            hpge_feats_mean=self.config.hpge_feats_mean,
+            hpge_feats_std=self.config.hpge_feats_std,
+            mode=3
+        )
+        collate_fn = NRECCollateFn(
+            cls_placeholder_id=self.config.cls_placeholder_id,
+            cuda_device=self.device
+        )
+        worker_init_fn = partial(
+            ParallelKFoldBootstrap_worker_init_fn,
+            None,
+            [lar_dataset]
+        )
+        self.glob_null_dataloader = DataLoader(
+            dataset=dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=False,
+            prefetch_factor=2,
+            persistent_workers=True,
+            worker_init_fn=worker_init_fn,
+            collate_fn=collate_fn
+        )
+
+        path = self.file_db.build_file(
+            tier="inference_dataset",
+            partition=self.partition,
+            version=self.dataset_version,
+            filename="classical_classifier_glob.npy"
+        )
+        self.classical_classifier_glob = np.load(path).astype(bool)
 
     def clean_state_dict(self, state_dict):
         cleaned_dict = {}
@@ -129,500 +241,387 @@ class Evaluator:
             cleaned_dict[cleaned_key] = value
         return cleaned_dict
 
-    @torch.no_grad()
     def load_ensemble(self, fid: int):
+        lar_detector_coords, hpge_detector_coords = decode_geom(
+            self.file_db.build_file(
+                tier="dataset",
+                partition=self.partition,
+                filename="detector_positions.yaml"
+            ), self.config
+        )
+
         self.ensemble = nn.ModuleList()
-        for i in range(self.config.num_bootstraps_per_fold):
-            model = ContrastiveRatioEstimator(
+        for bid in range(self.config.num_bootstraps_per_fold):
+            model = NREC(
+                lar_detector_coords=lar_detector_coords,
+                hpge_detector_coords=hpge_detector_coords,
                 config=self.config,
                 device=self.device
             ).to(dtype=torch.float32, device=self.device)
 
-            cp = torch.load(f'{self.model_dir}/fid_{fid}/bid_{i}/model.pt', map_location=self.device)
-            model.load_state_dict(self.clean_state_dict(cp["model"]), strict=True)
-            model = torch.compile(model, mode="reduce-overhead", dynamic=True)
+            cp = self.file_db.build_file(
+                tier="models",
+                partition=self.partition,
+                model_name=self.model_name,
+                version=self.version,
+                fid=fid,
+                bid=bid
+            )
+            cp = torch.load(cp, weights_only=True, map_location=self.device)["model"]
+            cp = self.clean_state_dict(cp)
+            model.load_state_dict(cp, strict=True)
+            model = torch.compile(model, dynamic=True)
             self.ensemble.append(model)
         torch.cuda.empty_cache()
 
-    @torch.no_grad()
-    def _set_null_anchor_buffer(self, mode_id: int):
-        self.cal_dataloader.dataset.set_mode(mode_id)
-        null_anchor_buffer = []
-        is_lar_vetoed = []
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, indices in self.cal_dataloader:
-            g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
-            b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.int32)
-            max_seqlen=int(max_seqlen)
-            lengths=lengths.to(device=self.device, non_blocking=True)
+    def model_forward(self, model: NREC, lar, hpge = None):
+        (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
+        t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        max_seqlen=int(max_seqlen)
 
-            indices = indices.numpy().astype(np.int64)
-            is_lar_vetoed.append(self.cal_4by4[indices])
+        if hpge is None:
+            (f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen) = (None, None, None, None)
+        else:
+            (_, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
 
-            anchor_ensemble = []
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
-                for model in self.ensemble:
-                    anchors, _ = model(# (B, D)
-                        g=g,
-                        E=E,
-                        b_idx=b_idx,
-                        t_idx=t_idx,
-                        s_idx=s_idx,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        lengths=lengths
-                    )
-                    anchor_ensemble.append(anchors.unsqueeze(0))
-            anchor_ensemble = torch.cat(anchor_ensemble, dim=0) # (n_ensemble, B, D) keep in bf16 for storage
-            null_anchor_buffer.append(anchor_ensemble)
-        is_lar_vetoed = np.concatenate(is_lar_vetoed, axis=0)
-        return null_anchor_buffer, is_lar_vetoed
+        e_lar, e_hpge = model(
+            t_idx=t_idx,
+            s_idx=s_idx,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            f_idx=f_idx,
+            f_vals=f_vals,
+            ge_cu_seqlens=ge_cu_seqlens,
+            ge_max_seqlen=ge_max_seqlen
+        )
+        e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
+        e_hpge = None if hpge is None else F.normalize(e_hpge, p=2, dim=-1) # (B, D)
 
-    def cache_null_anchors(self):
-        # Calibration dataset
-        self.null_anchor_buffer, self.null_is_lar_vetoed = self._set_null_anchor_buffer(mode_id=2)
-        # Null held-out dataset
-        self.null_val_anchor_buffer, self.null_val_is_lar_vetoed = self._set_null_anchor_buffer(mode_id=3)
+        return e_lar, e_hpge
 
-    def batch_forward(
-        self,
-        g: Tensor,
-        E: Tensor,
-        b_idx: Tensor,
-        t_idx: Tensor,
-        s_idx: Tensor,
-        cu_seqlens: Tensor,
-        max_seqlen: int,
-        lengths: Tensor
-    ):
+    def ensemble_forward(self, lar, hpge = None):
+        e_lar = []
         e_hpge = []
         logits = []
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            for model in self.ensemble:
-                anchors, e_hpge_ = model(
-                    g=g,
-                    E=E,
-                    b_idx=b_idx,
-                    t_idx=t_idx,
-                    s_idx=s_idx,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    lengths=lengths
-                )
-                logits.append(((anchors.to(dtype=torch.float32) * e_hpge_.to(dtype=torch.float32)).sum(dim=-1, keepdim=False) / self.config.temperature).unsqueeze(0)) # (B, )
-                e_hpge.append(e_hpge_.reshape(1, -1, self.config.hidden_size)) # (1, B, D)
-        e_hpge = torch.cat(e_hpge, dim=0).to(dtype=torch.float32) # (n_ensemble, B, D)
+        for model in self.ensemble:
+            e_lar_, e_hpge_ = self.model_forward(model, lar, hpge)
 
-        logits = torch.cat(logits, dim=0) # (n_ensemble, B)
-        delta = torch.var(logits, dim=0)
-        # Geometric mean
-        logits = (logits.sum(dim=0) / self.config.num_bootstraps_per_fold).to(dtype=torch.float32) # (B,)
+            if e_hpge_ is None:
+                e_lar.append(e_lar_.unsqueeze(0))
+            else:
+                logits_ = (e_lar_ * e_hpge_).sum(dim=-1, keepdim=True) * self.inv_temp
+                logits.append(logits_.unsqueeze(0))
+                e_hpge.append(e_hpge_.unsqueeze(0))
 
-        return delta, logits, e_hpge
+        if e_hpge_ is None:
+            return torch.cat(e_lar, dim=0) # (n_ensemble, B, D)
+        else:
+            logits = torch.cat(logits, dim=0) # (n_ensemble, B)
+            dlogits = torch.var(logits, dim=0)
+            logits = logits.mean(dim=0)
+
+            e_hpge = torch.cat(e_hpge, dim=0)
+
+            return logits, dlogits, e_hpge
+
+    def _get_null_buffer(self, dataloader, classical_classifier):
+        buffer = []
+        classical = []
+        for (lar, _), indices in dataloader:
+            e_lar = self.ensemble_forward(lar)
+            buffer.append(e_lar)
+            classical.append(classical_classifier[indices])
+
+        return buffer, classical # (n_ensemble, N_null, D), (N_null,)
+    
+    def _set_null_buffers(self):
+        self.ev_ep_null_buffer, _ = self._get_null_buffer(self.ev_ep_null_dataloader, self.classical_classifier_ev_ep)
+        self.glob_null_buffer, self.classical_classifier_glob_buffer = self._get_null_buffer(self.glob_null_dataloader, self.classical_classifier_glob)
+
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def evaluate_fold(self, fid: int):
+    def infer_fold(self, fid: int):
+        self.load_ensemble(fid)
+        self._set_null_buffers()
         self.phy_dataloader.dataset.set_fold_id(fid)
-        for g, E, b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths, indices in self.phy_dataloader:
+        for (lar, hpge), indices in self.phy_dataloader:
             # Calculate the test statistic of each event
-            delta, logits, e_hpge = self.batch_forward(# (B,), (n_ensemble, B, D), # (n_ensemble, B, D)
-                g=g.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                E=E.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
-                b_idx=b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
-                cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.int32),
-                max_seqlen=int(max_seqlen),
-                lengths=lengths.to(device=self.device, non_blocking=True)
-            )
+            logits, dlogits, e_hpge = self.ensemble_forward(lar, hpge) # (B,), (B,), (n_ensemble, B, D)
 
-            # Calculate the test statistic under the null for each event
+            # Calculate the evidence test statistic under the null for each event
             null_logits = []
-            for anchor in self.null_anchor_buffer:
-                null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
-                null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
-                null_logits.append(null_logits_)
-            null_logits_ = None
+            for e_null in self.ev_ep_null_buffer:
+                null_logits.append(
+                    torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp # (n_ensemble, B, B_rc)
+                )
+            null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_null)
+            dnull_logits = torch.var(null_logits, dim=0) # (B, N_null)
+            null_logits = null_logits.mean(dim=0) # (B, N_null)
 
-            null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-            null_delta = torch.var(null_logits, dim=0)
-            null_logits = torch.sum(null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-            # null_delta = null_delta - null_logits
+            # Calculate the evidence test statistic under the global null for each event
+            glob_null_logits = []
+            for e_null in self.glob_null_buffer:
+                glob_null_logits.append(
+                    torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp # (n_ensemble, B, B_rc)
+                )
 
-            # Calculate the test statistic under the heldout null for each event
-            heldout_null_logits = []
-            for anchor in self.null_val_anchor_buffer:
-                null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
-                null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
-                heldout_null_logits.append(null_logits_)
-            null_logits_ = None
-
-            heldout_null_logits = torch.cat(heldout_null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-            heldout_null_delta = torch.var(heldout_null_logits, dim=0)
-            heldout_null_logits = torch.sum(heldout_null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-            # heldout_null_delta = heldout_null_delta - heldout_null_logits
-
-            # Calculate the cut value (for plots)
-            cut = torch.quantile(null_logits, 1 - self.eval_config.alpha, dim=-1).cpu().numpy() # (B,)
+            glob_null_logits = torch.cat(glob_null_logits, dim=-1) # (n_ensemble, B, N_glob_null)
+            dglob_null_logits = torch.var(glob_null_logits, dim=0) # (B, N_glob_null)
+            glob_null_logits = glob_null_logits.mean(dim=0) # (B, N_glob_null)
 
             N_rc_data = null_logits.shape[1]
             # Evidence p-value
             p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
             p_val = p_val.cpu().numpy()
             # Epistemic p-value
-            p_val_ep = ((null_delta >= delta.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
+            p_val_ep = ((dnull_logits >= dlogits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
             p_val_ep = p_val_ep.cpu().numpy()
 
-            # Calculate the calibrated evidence and epistemic p-val under the heldout null (do it in batches)
-            sorted_null = null_logits.sort(dim=-1).values # (B, N_rc_data)
+            # Calculate the evidence and epistemic p-val under the null (for sanity check)
+            sorted_null = null_logits.sort(dim=-1).values # (B, N_null)
             null_logits = null_logits.cpu().numpy() # want to release
 
-            sorted_null_delta = null_delta.sort(dim=-1).values # (B, N_rc_data)
-            null_delta = null_delta.cpu().numpy()
+            sorted_dnull_logits = dnull_logits.sort(dim=-1).values # (B, N_null)
+            dnull_logits = dnull_logits.cpu().numpy()
 
-            heldout_null_logits_len = heldout_null_logits.shape[1]
-            num_iters = math.ceil(heldout_null_logits_len / self.config.local_batch_size)
+            null_logits_len = null_logits.shape[1]
+            num_iters = math.ceil(null_logits_len / self.batch_size)
     
             null_p_val = []
             null_p_val_ep = []
             for it in range(num_iters):
                 # (B, local_batch_size)
-                heldout_batch = heldout_null_logits[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_logits_len else heldout_null_logits[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
-                idx = torch.searchsorted(sorted_null, heldout_batch, right=False) # (B, lb)
-                null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
+                batch = null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > null_logits_len else null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
+                batch = torch.tensor(batch)
+                idx = torch.searchsorted(sorted_null, batch, right=False) # (B, N_null)
+                null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
                 null_p_val.append(null_p_val_)
 
-                heldout_batch = heldout_null_delta[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_logits_len else heldout_null_delta[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
-                idx = torch.searchsorted(sorted_null_delta, heldout_batch, right=False) # (B, lb)
-                null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
+                batch = dnull_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > null_logits_len else dnull_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
+                idx = torch.searchsorted(sorted_dnull_logits, batch, right=False) # (B, N_null)
+                null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
                 null_p_val_ep.append(null_p_val_)
 
             null_p_val_ = None
             idx = None
+            batch = None
 
-            null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
-            null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
+            null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, N_null)
+            null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, N_null)
 
-            g_id = g.to(torch.float32).cpu().numpy() # (B,)
-            energy = E.to(torch.float32).cpu().numpy() # (B,)
+            # Calculate the evidence and epistemic p-val under the global null (for t_global calibration)
+            glob_null_logits = glob_null_logits.cpu().numpy() # want to release
+            dglob_null_logits = dglob_null_logits.cpu().numpy()
 
-            # Global score calculation
-            indices = indices.numpy().astype(np.int64)
-            is_lar_vetoed = self.phy_4by4[indices]
-            flag_4by4 = (p_val_ep <= self.eval_config.alpha_epistemic) & is_lar_vetoed
+            glob_null_logits_len = glob_null_logits.shape[1]
+            num_iters = math.ceil(glob_null_logits_len / self.batch_size)
+    
+            glob_null_p_val = []
+            glob_null_p_val_ep = []
+            for it in range(num_iters):
+                # (B, local_batch_size)
+                batch = glob_null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_logits_len else glob_null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
+                batch = torch.tensor(batch)
+                idx = torch.searchsorted(sorted_null, batch, right=False) # (B, N_glob_null)
+                null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
+                glob_null_p_val.append(null_p_val_)
+
+                batch = dglob_null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_logits_len else dglob_null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
+                idx = torch.searchsorted(sorted_dnull_logits, batch, right=False) # (B, N_glob_null)
+                null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
+                glob_null_p_val_ep.append(null_p_val_)
+
+            null_p_val_ = None
+            idx = None
+            batch = None
+
+            glob_null_p_val = torch.cat(glob_null_p_val, dim=-1).cpu().numpy() # (B, N_glob_null)
+            glob_null_p_val_ep = torch.cat(glob_null_p_val_ep, dim=-1).cpu().numpy() # (B, N_glob_null)
+
+            # Global score calculation of each event
+            indices = np.array(indices).astype(np.int64)
+            is_lar_vetoed = self.classical_classifier_phy[indices]
+            flag_classical = (p_val_ep <= self.data_config["alpha_epistemic"]) & is_lar_vetoed
             global_score = np.copy(p_val)
-            global_score[flag_4by4] = 0. # always reject untrustworthy scores that do not pass the 4x4 classifier
+            global_score[flag_classical] = -0.05 # always reject untrustworthy scores that do not pass the classical classifier
 
-            # Split the heldout null dataset into global calibration dataset and validation
-            N_heldout_null = null_p_val.shape[1]
-            N_heldout_null_cal = math.ceil(self.eval_config.global_calib_frac * N_heldout_null)
-            N_heldout_null_val = N_heldout_null - N_heldout_null_cal
-
-            null_p_val_cal = null_p_val[:, :N_heldout_null_cal]
-            null_p_val = null_p_val[:, N_heldout_null_cal:]
-
-            null_p_val_ep_cal = null_p_val_ep[:, :N_heldout_null_cal]
-            null_p_val_ep = null_p_val_ep[:, N_heldout_null_cal:]
-
-            # Calculate the null global score
-            flag_4by4 = (null_p_val_ep_cal <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[:N_heldout_null_cal]
-            null_global_score = np.copy(null_p_val_cal)
-            null_global_score[flag_4by4] = 0.
-
-            # Calculate the heldout null global score
-            flag_4by4 = (null_p_val_ep <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[N_heldout_null_cal:]
-            heldout_null_global_score = np.copy(null_p_val)
-            heldout_null_global_score[flag_4by4] = 0.
+            # Global score calculation of global null
+            flag_classical = (glob_null_p_val_ep <= self.data_config["alpha_epistemic"]) & self.classical_classifier_glob_buffer
+            null_global_score = np.copy(glob_null_p_val)
+            null_global_score[flag_classical] = -0.05
 
             # Global p-value
-            p_val_glob = ((null_global_score <= global_score.reshape(-1, 1)).sum(axis=-1) + 1) / (N_heldout_null_cal + 1) # (B,)
+            N_glob_null = null_global_score.shape[-1]
+            p_val_glob = ((null_global_score <= global_score.reshape(-1, 1)).sum(axis=-1) + 1) / (N_glob_null + 1) # (B,)
 
-            # Global p-value under the held-out null
-            sorted_null = torch.tensor(null_global_score).sort(dim=-1).values
-            heldout_null_len = heldout_null_global_score.shape[1]
-            num_iters = math.ceil(heldout_null_len / self.config.local_batch_size)
-            heldout_null_p_val_glob = []
+            # Calculate the global p-val under the global null (for sanity check)
+            sorted_null = torch.tensor(null_global_score).sort(dim=-1).values # (B, N_glob_null)
+
+            glob_null_score_len = null_global_score.shape[1]
+            num_iters = math.ceil(glob_null_score_len / self.batch_size)
+    
+            glob_null_p_val_glob = []
             for it in range(num_iters):
-                heldout_batch = heldout_null_global_score[:, it*self.config.local_batch_size:] if (it + 1)*self.config.local_batch_size > heldout_null_len else heldout_null_global_score[:, it*self.config.local_batch_size: (it + 1)*self.config.local_batch_size]
-                heldout_batch = torch.tensor(heldout_batch)
-                idx = torch.searchsorted(sorted_null, heldout_batch, right=True) # (B, lb)
-                null_p_val_ = (idx.float() + 1) / (N_heldout_null_cal + 1)
-                heldout_null_p_val_glob.append(null_p_val_.numpy())
-            heldout_null_p_val_glob = np.concatenate(heldout_null_p_val_glob, axis=-1)
+                # (B, local_batch_size)
+                batch = null_global_score[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_score_len else null_global_score[:, it*self.batch_size: (it + 1)*self.batch_size]
+                batch = torch.tensor(batch)
+                idx = torch.searchsorted(sorted_null, batch, right=False) # (B, N_glob_null)
+                null_p_val_ = ((glob_null_score_len - idx).float() + 1) / (glob_null_score_len + 1)
+                glob_null_p_val_glob.append(null_p_val_)
 
-            table_size = len(energy)
+            null_p_val_ = None
+            idx = None
+            batch = None
+
+            glob_null_p_val_glob = torch.cat(glob_null_p_val_glob, dim=-1).cpu().numpy() # (B, N_glob_null)
+
+            # retrieve HPGe observables
+            (_, f_idx, f_vals, _, _, _) = hpge
+            # NOTE: this part is hardcoded based on the data ordering from utils/create_base_dataset.py
+            gid = f_vals[f_idx == 0].cpu().numpy().astype(np.float32)
+            gid = gid * self.config.hpge_feats_std[0] + self.config.hpge_feats_mean[0]
+
+            energy = f_vals[f_idx == 1].cpu().numpy().astype(np.float32)
+            energy = energy * self.config.hpge_feats_std[1] + self.config.hpge_feats_mean[1]
+
+            drift_time = f_vals[f_idx == 2].cpu().numpy().astype(np.float32)
+            drift_time = drift_time * self.config.hpge_feats_std[2] + self.config.hpge_feats_mean[2]
+
+            aoe = f_vals[f_idx == 3].cpu().numpy().astype(np.float32)
+            aoe = aoe * self.config.hpge_feats_std[3] + self.config.hpge_feats_mean[3]
+
+            lq = f_vals[f_idx == 4].cpu().numpy().astype(np.float32)
+            lq = lq * self.config.hpge_feats_std[4] + self.config.hpge_feats_mean[4]
+
+            table_size = len(indices)
             lgdo_table = Table(
                 size=table_size,
                 col_dict={
                     "evt_idx": Array(indices.astype(np.float32)),
-                    "g_id": Array(g_id, dtype=np.float32),
+                    "g_id": Array(gid, dtype=np.float32),
                     "energy": Array(energy, dtype=np.float32),
+                    "drift_time": Array(drift_time, dtype=np.float32),
+                    "aoe": Array(aoe, dtype=np.float32),
+                    "lq": Array(lq, dtype=np.float32),
+
                     "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
 
-                    "t_epistemic": Array(delta.cpu().numpy(), dtype=np.float32),
+                    # evidence and epistemic test statistics and p-values
+                    "t_epistemic": Array(dlogits.cpu().numpy(), dtype=np.float32),
                     "t_evidence": Array(logits.cpu().numpy(), dtype=np.float32),
-                    "t_global": Array(global_score, dtype=np.float32),
-                    "cut": Array(cut, dtype=np.float32),
-
                     "p_evidence": Array(p_val, dtype=np.float32),
                     "p_epistemic": Array(p_val_ep, dtype=np.float32),
+
+                    # sanity checks (calibrationg null_t_evidence and null_t_epistemic with itself) --> uniformly distributed in (0, 1]
+                    "null_t_epistemic": Array(dnull_logits, dtype=np.float32),
+                    "null_t_evidence": Array(null_logits, dtype=np.float32),
+                    "null_p_epistemic": Array(dnull_logits, dtype=np.float32),
+                    "null_p_evidence": Array(null_logits, dtype=np.float32),
+
+                    # global null evidence and epistemic test statistics and p-values (for global test statistic calibration)
+                    "glob_null_t_epistemic": Array(glob_null_logits, dtype=np.float32),
+                    "glob_null_t_evidence": Array(dglob_null_logits, dtype=np.float32),
+                    "glob_null_p_epistemic": Array(glob_null_p_val_ep, dtype=np.float32),
+                    "glob_null_p_evidence": Array(glob_null_p_val, dtype=np.float32),
+
+                    # global test statistic and p-value
+                    "t_global": Array(global_score, dtype=np.float32),
                     "p_global": Array(p_val_glob, dtype=np.float32),
 
-                    "null_t_epistemic": Array(null_delta, dtype=np.float32),
-                    "null_t_evidence": Array(null_logits, dtype=np.float32),
-
-                    "heldout_null_t_global": Array(heldout_null_global_score, dtype=np.float32),
-
-                    "heldout_null_p_evidence_cal": Array(null_p_val_cal, dtype=np.float32),
-                    "heldout_null_p_epistemic_cal": Array(null_p_val_ep_cal, dtype=np.float32),
-
-                    "heldout_null_p_evidence_test": Array(null_p_val, dtype=np.float32),
-                    "heldout_null_p_epistemic_test": Array(null_p_val_ep, dtype=np.float32),
-                    "heldout_null_p_global_test": Array(heldout_null_p_val_glob, dtype=np.float32),
-
-                    "null_t_global": Array(null_global_score, dtype=np.float32),
-                    "t_global": Array(global_score, dtype=np.float32)
+                    # global null global test statistic and p-value for calibration and sanity check
+                    "glob_null_t_global": Array(global_score, dtype=np.float32),
+                    "glob_null_p_global": Array(glob_null_p_val_glob, dtype=np.float32)
                 }
             )
+
+            path = self.file_db.build_file(
+                tier="inference",
+                partition=self.partition,
+                version=self.dataset_version,
+                model_name=self.model_name,
+                model_version=self.version
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             lh5.write(
                 lgdo_table,
-                "phy/tcal", # NOTE: for now hardcoded
-                self.save_to + "/inferred.lh5",
+                "phy/inf",
+                path,
                 n_rows=table_size,
                 wo_mode="append"
             )
-        self.null_anchor_buffer = None
-        self.null_val_anchor_buffer = None
+        
+        self.ev_ep_null_buffer = None
+        self.glob_null_buffer = None
 
-    def encode_hpge(self, g: Tensor, E: Tensor):
-        e_hpge = []
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            for model in self.ensemble:
-                e_hpge_ = model.joint_hpge_emb(g=g, E=E)
-                e_hpge_ = F.normalize(e_hpge_.to(dtype=torch.float32), p=2, dim=-1)
-                e_hpge.append(e_hpge_.reshape(1, -1, self.config.hidden_size)) # (1, B, D)
-        e_hpge = torch.cat(e_hpge, dim=0).to(dtype=torch.float32) # (n_ensemble, B, D)
-        return e_hpge
+    def infer(self):
+        path = self.file_db.build_file(
+            tier="inference",
+            partition=self.partition,
+            version=self.dataset_version,
+            model_name=self.model_name,
+            model_version=self.version
+        )
+        if os.path.isfile(path):
+            print(f'{path} exists. Deleting...')
+            os.remove(path)
 
-    @torch.no_grad()
-    def scan_across_energies(self, fid: int):
-        self.load_ensemble(fid)
-        self.cache_null_anchors()
-        energy_grid = (torch.arange(200, 3000, 1, dtype=torch.float32, device=self.device) - self.config.hpge_energy_mean) / self.config.hpge_energy_std
-
-        B = self.config.local_batch_size // 2
-        num_batches = math.ceil(energy_grid.shape[0] / B)
-        gedet_indices = torch.arange(self.config.num_hpges, device=self.device, dtype=torch.long)
-
-        for gedet_idx in gedet_indices:
-            for batch_idx in range(num_batches):
-                energy = energy_grid[batch_idx*B:] if (batch_idx * (B + 1)) > energy_grid.shape[0] else energy_grid[batch_idx*B: (batch_idx + 1)*B]
-                e_hpge = self.encode_hpge(g=gedet_idx.unsqueeze(0).repeat_interleave(energy.shape[0], dim=0).reshape(-1), E=energy) # (n_ensemble, B, D)
-
-                # Null
-                null_logits = []
-                for anchor in self.null_anchor_buffer:
-                    null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
-                    null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
-                    null_logits.append(null_logits_)
-                null_logits_ = None
-
-                null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-                null_delta = torch.var(null_logits, dim=0)
-                null_logits = torch.sum(null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-
-                # heldout null
-                heldout_null_logits = []
-                for anchor in self.null_val_anchor_buffer:
-                    null_logits_ = e_hpge.unsqueeze(2) * anchor.to(torch.float32).unsqueeze(1) # (n_ensemble, B, 1, D) * (n_ensemble, 1, B_rc, D) = (n_ensemble, B, B_rc, D)
-                    null_logits_ = null_logits_.sum(dim=-1) / self.config.temperature # (n_ensemble, B, B_rc)
-                    heldout_null_logits.append(null_logits_)
-                null_logits_ = None
-
-                heldout_null_logits = torch.cat(heldout_null_logits, dim=-1) # (n_ensemble, B, N_rc_data)
-                heldout_null_delta = torch.var(heldout_null_logits, dim=0)
-                heldout_null_logits = torch.sum(heldout_null_logits, dim=0) / self.config.num_bootstraps_per_fold # (B, N_rc_data)
-
-                N_rc_data = null_logits.shape[1]
-                sorted_null = null_logits.sort(dim=-1).values # (B, N_rc_data)
-                null_logits = null_logits.cpu().numpy() # want to release
-
-                sorted_null_delta = null_delta.sort(dim=-1).values # (B, N_rc_data)
-                null_delta = null_delta.cpu().numpy()
-
-                heldout_null_logits_len = heldout_null_logits.shape[1]
-                num_iters = math.ceil(heldout_null_logits_len / B)
-
-                null_p_val = []
-                null_p_val_ep = []
-                for it in range(num_iters):
-                    # (B, local_batch_size)
-                    heldout_batch = heldout_null_logits[:, it*B:] if (it + 1)*B > heldout_null_logits_len else heldout_null_logits[:, it*B: (it + 1)*B]
-                    idx = torch.searchsorted(sorted_null, heldout_batch, right=False) # (B, lb)
-                    null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
-                    null_p_val.append(null_p_val_)
-
-                    heldout_batch = heldout_null_delta[:, it*B:] if (it + 1)*B > heldout_null_logits_len else heldout_null_delta[:, it*B: (it + 1)*B]
-                    idx = torch.searchsorted(sorted_null_delta, heldout_batch, right=False) # (B, lb)
-                    null_p_val_ = ((N_rc_data - idx).float() + 1) / (N_rc_data + 1)
-                    null_p_val_ep.append(null_p_val_)
-
-                null_p_val_ = None
-                idx = None
-
-                null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
-                null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, heldout_null_logits_len)
-                energy = energy.to(torch.float32).cpu().numpy()
-
-                # Split the heldout null dataset into global calibration dataset and validation
-                N_heldout_null = null_p_val.shape[1]
-                N_heldout_null_cal = math.ceil(self.eval_config.global_calib_frac * N_heldout_null)
-                N_heldout_null_val = N_heldout_null - N_heldout_null_cal
-
-                null_p_val_cal = null_p_val[:, :N_heldout_null_cal]
-                null_p_val = null_p_val[:, N_heldout_null_cal:]
-
-                null_p_val_ep_cal = null_p_val_ep[:, :N_heldout_null_cal]
-                null_p_val_ep = null_p_val_ep[:, N_heldout_null_cal:]
-
-                # Calculate the null global score
-                flag_4by4 = (null_p_val_ep_cal <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[:N_heldout_null_cal]
-                null_global_score = np.copy(null_p_val_cal)
-                null_global_score[flag_4by4] = 0.
-
-                # Calculate the heldout null global score
-                flag_4by4 = (null_p_val_ep <= self.eval_config.alpha_epistemic) & self.null_val_is_lar_vetoed[N_heldout_null_cal:]
-                heldout_null_global_score = np.copy(null_p_val)
-                heldout_null_global_score[flag_4by4] = 0.
-
-                # Global p-value under the held-out null
-                sorted_null = torch.tensor(null_global_score).sort(dim=-1).values
-                heldout_null_len = heldout_null_global_score.shape[1]
-                num_iters = math.ceil(heldout_null_len / B)
-                heldout_null_p_val_glob = []
-                for it in range(num_iters):
-                    heldout_batch = heldout_null_global_score[:, it*B:] if (it + 1)*B > heldout_null_len else heldout_null_global_score[:, it*B: (it + 1)*B]
-                    heldout_batch = torch.tensor(heldout_batch)
-                    idx = torch.searchsorted(sorted_null, heldout_batch, right=True) # (B, lb)
-                    null_p_val_ = (idx.float() + 1) / (N_heldout_null_cal + 1)
-                    heldout_null_p_val_glob.append(null_p_val_.numpy())
-                heldout_null_p_val_glob = np.concatenate(heldout_null_p_val_glob, axis=-1)
-
-                table_size = len(energy)
-                lgdo_table = Table(
-                    size=table_size,
-                    col_dict={
-                        "energy": Array(energy, dtype=np.float32),
-
-                        "null_t_epistemic": Array(null_delta, dtype=np.float32),
-                        "null_t_evidence": Array(null_logits, dtype=np.float32),
-                        "null_t_global": Array(null_global_score, dtype=np.float32),
-
-                        "heldout_null_t_global": Array(heldout_null_global_score, dtype=np.float32),
-
-                        "heldout_null_p_evidence_cal": Array(null_p_val_cal, dtype=np.float32),
-                        "heldout_null_p_epistemic_cal": Array(null_p_val_ep_cal, dtype=np.float32),
-
-                        "heldout_null_p_evidence_test": Array(null_p_val, dtype=np.float32),
-                        "heldout_null_p_epistemic_test": Array(null_p_val_ep, dtype=np.float32),
-                        "heldout_null_p_global_test": Array(heldout_null_p_val_glob, dtype=np.float32)
-                    }
-                )
-                lh5.write(
-                    lgdo_table,
-                    "grid_scan/gedet_gid{gid:02d}".format(gid=int(gedet_idx.view(-1).item())),
-                    self.save_to + "/grid_scan.lh5",
-                    n_rows=table_size,
-                    wo_mode="append"
-                )
-        self.null_anchor_buffer = None
-        self.null_val_anchor_buffer = None
-
-    def evaluate(self):
         for fid in range(self.config.num_folds):
-            self.load_ensemble(fid)
-            self.cache_null_anchors()
-            self.evaluate_fold(fid)
-
-            self.null_anchor_buffer = None
-            # Null held-out dataset
-            self.null_val_anchor_buffer = None
+            self.infer_fold(fid)
 
         torch.cuda.empty_cache()
 
-        # for fid in range(self.config.num_folds):
-        #     self.scan_across_energies(fid)
-        #     self.null_anchor_buffer = None
-        #     # Null held-out dataset
-        #     self.null_val_anchor_buffer = None
-        #     break
+def main(
+    experiment: str,
+    partition: str,
+    model_name: str,
+    version: str,
+    train_dataset_version: str,
+    dataflow_dir: str,
+    batch_size: int,
+    cache_dir: str
+):
+    _, _, device = _init_torch(cache_dir)
 
-def evaluate(experiment: str, model_name: str, version: str, period: str, working_dir: str, data_dir: str):
-    local_rank, rank, world_size, device = _init_torch()
-    wd = Path(working_dir)
-    mmpd = Path(data_dir)
-
-    with open(str(wd / "trained" / experiment / model_name / "eval_config.json"), "r") as f:
-        eval_cfg = json.load(f)
-    
-    eval_config = EvalConfig()
-    eval_config.__dict__.update(eval_cfg)
-
-    config, data_config, paths = _initialize_configs(
-        config_obj=BootstrappedKFoldConfig(),
-        wd=wd,
-        experiment=experiment,
-        model_name=model_name,
-        version=version,
-        mmpd=mmpd
+    file_db = FileDB(
+        working_dir=dataflow_dir,
+        experiment=experiment
     )
 
-    config.data_paths = [str(paths.data_dir / f"{key}.npz") for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
-    config.prior = [data_config[key]["prior"] for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
-    config.labels = [data_config[key]["label"] for key in data_config.keys() if str(key) != "hpge_id_and_energy"]
-    config.hpge_id_and_energy = data_config["hpge_id_and_energy"]
-    config.hpge_id_and_energy = str(paths.data_dir / f'{config.hpge_id_and_energy}.npy')
-
-    os.makedirs(wd / "data" / experiment / "tier" / model_name / period, exist_ok=True)
-    evaluator = Evaluator(
-        config=config,
-        eval_config=eval_config,
-        model_dir=str(wd / "trained" / experiment / model_name / version / "checkpoints"),
-        data_dir=paths.data_dir,
-        save_to=str(wd / "data" / experiment / "tier" / model_name / period),
+    calibrator = NRECCalibrator(
+        file_db=file_db,
+        partition=partition,
+        model_name=model_name,
+        version=version,
+        dataset_version=train_dataset_version,
+        batch_size=batch_size,
         device=device
     )
 
-    evaluator.evaluate()
+    calibrator.infer()
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Training started")
-    parser.add_argument("experiment", type=str)
-    parser.add_argument("model_name", type=str, help="Name of the model being trained")
-    parser.add_argument("version", type=str)
-    parser.add_argument("working_dir", type=str, help="Top-most dir of the training pipeline")
-    parser.add_argument("data_dir", type=str, help="Directory the training data is saved under")
-    parser.add_argument("training_config", type=str, help="JSON config file of the training, which contains model and training configurations, data configs, etc.")
-    parser.add_argument("cache_dir", type=str, help="Directory to store torch.inductor and triton cache")
+    parser = argparse.ArgumentParser(description="Calibration started")
+    parser.add_argument("experiment", type=str, help="Name of the experiment")
+    parser.add_argument("partition", type=str, help="partition name")
+    parser.add_argument("model_name", type=str, help="Name of the model")
+    parser.add_argument("version", type=str, help="Model version")
+    parser.add_argument("train_dataset_version", type=str, help="Traning dataset version")
+    parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
+    parser.add_argument("batch_size", type=str, help="Batch size")
+    parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
     args = parser.parse_args()
 
-    import os
-    from pathlib import Path
-
-    BASE = args.cache_dir
-    rank = os.environ["RANK"]
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{BASE}/inductor")
-    os.environ.setdefault("TRITON_CACHE_DIR", f"{BASE}/triton/rank_{rank}")
-    os.environ.setdefault("NUMBA_CACHE_DIR", f"{BASE}/numba/rank_{rank}")
-
-    Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-
-    JOB_SHM_DIR = os.environ["JOB_SHMTMPDIR"] if "JOB_SHMTMPDIR" in os.environ else None
-
-    evaluate(args.experiment, args.model_name, args.version, args.working_dir, args.data_dir, args.training_config)
+    main(
+        args.experiment,
+        args.partition,
+        args.model_name,
+        args.version,
+        args.train_dataset_version,
+        args.dataflow_dir,
+        args.batch_size,
+        args.cache_dir
+    )
