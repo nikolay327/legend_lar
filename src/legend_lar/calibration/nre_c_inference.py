@@ -285,6 +285,10 @@ class NRECCalibrator:
             (f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen) = (None, None, None, None)
         else:
             (_, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
+            f_idx=f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            f_vals=f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            ge_max_seqlen=int(ge_max_seqlen)
 
         e_lar, e_hpge = model(
             t_idx=t_idx,
