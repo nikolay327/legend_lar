@@ -654,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument("version", type=str, help="Model version")
     parser.add_argument("train_dataset_version", type=str, help="Traning dataset version")
     parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
-    parser.add_argument("batch_size", type=str, help="Batch size")
+    parser.add_argument("batch_size", type=int, help="Batch size")
     parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
     args = parser.parse_args()
 
