@@ -347,6 +347,23 @@ class NRECCalibrator:
 
         torch.cuda.empty_cache()
 
+    def unpack_hpge_nrec_data(
+        self,
+        b_all: Tensor,
+        f_all: Tensor,
+        v_all: Tensor,
+        lengths: Tensor
+    ):
+        b_all = b_all.to(torch.long)
+        f_all = f_all.to(torch.long)
+        B = lengths.numel()
+        x = torch.full((B, self.config.hpge_num_features + 1), float("nan"), device=v_all.device, dtype=v_all.dtype) # NOTE: for now, +1 is hardcoded bcs pid is not included
+
+        mask = (f_all != self.config.cls_placeholder_id) # ignore CLS tokens
+        x[b_all[mask], f_all[mask]] = v_all[mask]
+
+        return x
+
     @torch.no_grad()
     def infer_fold(self, fid: int):
         self.load_ensemble(fid)
@@ -497,21 +514,24 @@ class NRECCalibrator:
                 glob_null_p_val_glob = torch.cat(glob_null_p_val_glob, dim=-1).cpu().numpy() # (B, N_glob_null)
 
             # retrieve HPGe observables
-            (_, f_idx, f_vals, _, _, _) = hpge
+            (b_idx, f_idx, f_vals, _, _, geds_lengths) = hpge
             # NOTE: this part is hardcoded based on the data ordering from utils/create_base_dataset.py
-            gid = f_vals[f_idx == 0].cpu().numpy().astype(np.float32)
+            geds_features = self.unpack_hpge_nrec_data(b_idx, f_idx, f_vals, geds_lengths) # (B, H)
+            geds_features = geds_features.cpu().numpy().astype(np.float32)
+
+            gid = geds_features[: 0]
             gid = gid * self.config.hpge_feats_std[0] + self.config.hpge_feats_mean[0]
 
-            energy = f_vals[f_idx == 1].cpu().numpy().astype(np.float32)
+            energy = geds_features[: 1]
             energy = energy * self.config.hpge_feats_std[1] + self.config.hpge_feats_mean[1]
 
-            drift_time = f_vals[f_idx == 2].cpu().numpy().astype(np.float32)
+            drift_time = geds_features[: 2]
             drift_time = drift_time * self.config.hpge_feats_std[2] + self.config.hpge_feats_mean[2]
 
-            aoe = f_vals[f_idx == 3].cpu().numpy().astype(np.float32)
+            aoe = geds_features[: 3]
             aoe = aoe * self.config.hpge_feats_std[3] + self.config.hpge_feats_mean[3]
 
-            lq = f_vals[f_idx == 4].cpu().numpy().astype(np.float32)
+            lq = geds_features[: 4]
             lq = lq * self.config.hpge_feats_std[4] + self.config.hpge_feats_mean[4]
 
             table_size = len(indices)
