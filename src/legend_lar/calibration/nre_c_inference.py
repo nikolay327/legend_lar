@@ -315,7 +315,7 @@ class NRECCalibrator:
             if e_hpge_ is None:
                 e_lar.append(e_lar_.unsqueeze(0))
             else:
-                logits_ = (e_lar_ * e_hpge_).sum(dim=-1, keepdim=True) * self.inv_temp
+                logits_ = (e_lar_ * e_hpge_).sum(dim=-1, keepdim=False) * self.inv_temp
                 logits.append(logits_.unsqueeze(0))
                 e_hpge.append(e_hpge_.unsqueeze(0))
 
@@ -435,6 +435,7 @@ class NRECCalibrator:
             null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, N_null)
             null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, N_null)
 
+            is_lar_vetoed = self.classical_classifier_phy[indices]
             if self.data_config["alpha_epistemic"] > 0:
                 # Calculate the evidence and epistemic p-val under the global null (for t_global calibration)
                 glob_null_logits = glob_null_logits.cpu().numpy() # want to release
@@ -468,7 +469,6 @@ class NRECCalibrator:
 
                 # Global score calculation of each event
                 indices = np.array(indices).astype(np.int64)
-                is_lar_vetoed = self.classical_classifier_phy[indices]
                 flag_classical = (p_val_ep <= self.data_config["alpha_epistemic"]) & is_lar_vetoed
 
                 eps = 1e-6
@@ -519,19 +519,19 @@ class NRECCalibrator:
             geds_features = self.unpack_hpge_nrec_data(b_idx, f_idx, f_vals, geds_lengths) # (B, H)
             geds_features = geds_features.cpu().numpy().astype(np.float32)
 
-            gid = geds_features[: 0]
+            gid = geds_features[:, 0]
             gid = gid * self.config.hpge_feats_std[0] + self.config.hpge_feats_mean[0]
 
-            energy = geds_features[: 1]
+            energy = geds_features[:, 1]
             energy = energy * self.config.hpge_feats_std[1] + self.config.hpge_feats_mean[1]
 
-            drift_time = geds_features[: 2]
+            drift_time = geds_features[:, 2]
             drift_time = drift_time * self.config.hpge_feats_std[2] + self.config.hpge_feats_mean[2]
 
-            aoe = geds_features[: 3]
+            aoe = geds_features[:, 3]
             aoe = aoe * self.config.hpge_feats_std[3] + self.config.hpge_feats_mean[3]
 
-            lq = geds_features[: 4]
+            lq = geds_features[:, 4]
             lq = lq * self.config.hpge_feats_std[4] + self.config.hpge_feats_mean[4]
 
             table_size = len(indices)
