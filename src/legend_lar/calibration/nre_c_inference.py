@@ -337,6 +337,7 @@ class NRECCalibrator:
             e_lar = self.ensemble_forward(lar)
             buffer.append(e_lar)
             classical.append(classical_classifier[indices])
+        classical = np.concatenate(classical, axis=0)
 
         return buffer, classical # (n_ensemble, N_null, D), (N_null,)
     
