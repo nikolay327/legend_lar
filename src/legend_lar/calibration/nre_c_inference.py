@@ -139,6 +139,11 @@ class NRECCalibrator:
             filename="classical_classifier_phy.npy"
         )
         self.classical_classifier_phy = np.load(path).astype(bool)
+        self.classical_classifier_phy = torch.as_tensor(
+                self.classical_classifier_phy,
+                device=self.device,
+                dtype=torch.bool
+            )
 
     def _init_ev_ep_null_dataloader(self):
         lar_dataset = self.file_db.build_file(
@@ -484,18 +489,15 @@ class NRECCalibrator:
             # Epistemic p-value
             p_val_ep = self._right_tail_pval_from_sorted(sorted_dnull_logits, dlogits, add_one=True)  # (B,)
 
-            null_p_val = self._chunked_right_tail_matrix_pvals(
-                sorted_null, null_logits, add_one=False
-            )  # (B, N_null)
-            null_p_val_ep = self._chunked_right_tail_matrix_pvals(
-                sorted_dnull_logits, dnull_logits, add_one=False
-            )  # (B, N_null)
+            # Not needed (can use the global null to check)
+            # null_p_val = self._chunked_right_tail_matrix_pvals(
+            #     sorted_null, null_logits, add_one=False
+            # )  # (B, N_null)
+            # null_p_val_ep = self._chunked_right_tail_matrix_pvals(
+            #     sorted_dnull_logits, dnull_logits, add_one=False
+            # )  # (B, N_null)
 
-            is_lar_vetoed = torch.as_tensor(
-                self.classical_classifier_phy[indices],
-                device=device,
-                dtype=torch.bool
-            )
+            is_lar_vetoed = self.classical_classifier_phy[indices]
 
             if self.data_config["alpha_epistemic"] > 0:
                 # Calculate the evidence test statistic under the global null for each event
@@ -579,100 +581,100 @@ class NRECCalibrator:
 
             table_size = len(indices)
 
-            indices_np = np.array(indices).astype(np.float32)
-            gid_np = gid.float().cpu().numpy()
-            energy_np = energy.float().cpu().numpy()
-            drift_time_np = drift_time.float().cpu().numpy()
-            aoe_np = aoe.float().cpu().numpy()
-            lq_np = lq.float().cpu().numpy()
+            indices = np.array(indices).astype(np.float32)
+            gid = gid.float().cpu().numpy()
+            energy = energy.float().cpu().numpy()
+            drift_time = drift_time.float().cpu().numpy()
+            aoe = aoe.float().cpu().numpy()
+            lq = lq.float().cpu().numpy()
 
-            is_lar_vetoed_np = is_lar_vetoed.float().cpu().numpy()
-            logits_np = logits.float().cpu().numpy()
-            dlogits_np = dlogits.float().cpu().numpy()
-            p_val_np = p_val.float().cpu().numpy()
-            p_val_ep_np = p_val_ep.float().cpu().numpy()
+            is_lar_vetoed = is_lar_vetoed.float().cpu().numpy()
+            logits = logits.float().cpu().numpy()
+            dlogits = dlogits.float().cpu().numpy()
+            p_val = p_val.float().cpu().numpy()
+            p_val_ep = p_val_ep.float().cpu().numpy()
 
-            null_logits_np = null_logits.float().cpu().numpy()
-            dnull_logits_np = dnull_logits.float().cpu().numpy()
-            null_p_val_np = null_p_val.float().cpu().numpy()
-            null_p_val_ep_np = null_p_val_ep.float().cpu().numpy()
+            null_logits = null_logits.float().cpu().numpy()
+            dnull_logits = dnull_logits.float().cpu().numpy()
+            # null_p_val = null_p_val.float().cpu().numpy()
+            # null_p_val_ep = null_p_val_ep.float().cpu().numpy()
 
             if self.data_config["alpha_epistemic"] > 0:
-                glob_null_logits_np = glob_null_logits.float().cpu().numpy()
-                dglob_null_logits_np = dglob_null_logits.float().cpu().numpy()
-                glob_null_p_val_np = glob_null_p_val.float().cpu().numpy()
-                glob_null_p_val_ep_np = glob_null_p_val_ep.float().cpu().numpy()
-                global_score_np = global_score.float().cpu().numpy()
-                p_val_glob_np = p_val_glob.float().cpu().numpy()
-                null_global_score_np = null_global_score.float().cpu().numpy()
-                glob_null_p_val_glob_np = glob_null_p_val_glob.float().cpu().numpy()
+                glob_null_logits = glob_null_logits.float().cpu().numpy()
+                dglob_null_logits = dglob_null_logits.float().cpu().numpy()
+                glob_null_p_val = glob_null_p_val.float().cpu().numpy()
+                glob_null_p_val_ep = glob_null_p_val_ep.float().cpu().numpy()
+                global_score = global_score.float().cpu().numpy()
+                p_val_glob = p_val_glob.float().cpu().numpy()
+                null_global_score = null_global_score.float().cpu().numpy()
+                glob_null_p_val_glob = glob_null_p_val_glob.float().cpu().numpy()
 
                 lgdo_table = Table(
                     size=table_size,
                     col_dict={
-                        "evt_idx": Array(indices_np),
-                        "g_id": Array(gid_np, dtype=np.float32),
-                        "energy": Array(energy_np, dtype=np.float32),
-                        "drift_time": Array(drift_time_np, dtype=np.float32),
-                        "aoe": Array(aoe_np, dtype=np.float32),
-                        "lq": Array(lq_np, dtype=np.float32),
+                        "evt_idx": Array(indices),
+                        "g_id": Array(gid, dtype=np.float32),
+                        "energy": Array(energy, dtype=np.float32),
+                        "drift_time": Array(drift_time, dtype=np.float32),
+                        "aoe": Array(aoe, dtype=np.float32),
+                        "lq": Array(lq, dtype=np.float32),
 
-                        "is_lar_vetoed": Array(is_lar_vetoed_np, dtype=np.float32),
+                        "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
 
                         # evidence and epistemic test statistics and p-values
-                        "t_epistemic": Array(dlogits_np, dtype=np.float32),
-                        "t_evidence": Array(logits_np, dtype=np.float32),
-                        "p_evidence": Array(p_val_np, dtype=np.float32),
-                        "p_epistemic": Array(p_val_ep_np, dtype=np.float32),
+                        "t_epistemic": Array(dlogits, dtype=np.float32),
+                        "t_evidence": Array(logits, dtype=np.float32),
+                        "p_evidence": Array(p_val, dtype=np.float32),
+                        "p_epistemic": Array(p_val_ep, dtype=np.float32),
 
                         # sanity checks (calibrationg null_t_evidence and null_t_epistemic with itself) --> uniformly distributed in (0, 1]
-                        "null_t_epistemic": Array(dnull_logits_np, dtype=np.float32),
-                        "null_t_evidence": Array(null_logits_np, dtype=np.float32),
-                        "null_p_epistemic": Array(null_p_val_ep_np, dtype=np.float32),
-                        "null_p_evidence": Array(null_p_val_np, dtype=np.float32),
+                        "null_t_epistemic": Array(dnull_logits, dtype=np.float32),
+                        "null_t_evidence": Array(null_logits, dtype=np.float32),
+                        # "null_p_epistemic": Array(null_p_val_ep, dtype=np.float32),
+                        # "null_p_evidence": Array(null_p_val, dtype=np.float32),
 
                         # global null evidence and epistemic test statistics and p-values (for global test statistic calibration)
-                        "glob_null_t_epistemic": Array(dglob_null_logits_np, dtype=np.float32),
-                        "glob_null_t_evidence": Array(glob_null_logits_np, dtype=np.float32),
-                        "glob_null_p_epistemic": Array(glob_null_p_val_ep_np, dtype=np.float32),
-                        "glob_null_p_evidence": Array(glob_null_p_val_np, dtype=np.float32),
+                        "glob_null_t_epistemic": Array(dglob_null_logits, dtype=np.float32),
+                        "glob_null_t_evidence": Array(glob_null_logits, dtype=np.float32),
+                        "glob_null_p_epistemic": Array(glob_null_p_val_ep, dtype=np.float32),
+                        "glob_null_p_evidence": Array(glob_null_p_val, dtype=np.float32),
 
                         # global test statistic and p-value
-                        "t_global": Array(global_score_np, dtype=np.float32),
-                        "p_global": Array(p_val_glob_np, dtype=np.float32),
+                        "t_global": Array(global_score, dtype=np.float32),
+                        "p_global": Array(p_val_glob, dtype=np.float32),
 
                         # global null global test statistic and p-value for calibration and sanity check
-                        "glob_null_t_global": Array(null_global_score_np, dtype=np.float32),
-                        "glob_null_p_global": Array(glob_null_p_val_glob_np, dtype=np.float32)
+                        "glob_null_t_global": Array(null_global_score, dtype=np.float32),
+                        "glob_null_p_global": Array(glob_null_p_val_glob, dtype=np.float32)
                     }
                 )
             else:
                 lgdo_table = Table(
                     size=table_size,
                     col_dict={
-                        "evt_idx": Array(indices_np),
-                        "g_id": Array(gid_np, dtype=np.float32),
-                        "energy": Array(energy_np, dtype=np.float32),
-                        "drift_time": Array(drift_time_np, dtype=np.float32),
-                        "aoe": Array(aoe_np, dtype=np.float32),
-                        "lq": Array(lq_np, dtype=np.float32),
+                        "evt_idx": Array(indices),
+                        "g_id": Array(gid, dtype=np.float32),
+                        "energy": Array(energy, dtype=np.float32),
+                        "drift_time": Array(drift_time, dtype=np.float32),
+                        "aoe": Array(aoe, dtype=np.float32),
+                        "lq": Array(lq, dtype=np.float32),
 
-                        "is_lar_vetoed": Array(is_lar_vetoed_np, dtype=np.float32),
+                        "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
 
                         # evidence and epistemic test statistics and p-values
-                        "t_epistemic": Array(dlogits_np, dtype=np.float32),
-                        "t_evidence": Array(logits_np, dtype=np.float32),
-                        "p_evidence": Array(p_val_np, dtype=np.float32),
-                        "p_epistemic": Array(p_val_ep_np, dtype=np.float32),
+                        "t_epistemic": Array(dlogits, dtype=np.float32),
+                        "t_evidence": Array(logits, dtype=np.float32),
+                        "p_evidence": Array(p_val, dtype=np.float32),
+                        "p_epistemic": Array(p_val_ep, dtype=np.float32),
 
                         # sanity checks (calibrationg null_t_evidence and null_t_epistemic with itself) --> uniformly distributed in (0, 1]
-                        "null_t_epistemic": Array(dnull_logits_np, dtype=np.float32),
-                        "null_t_evidence": Array(null_logits_np, dtype=np.float32),
-                        "null_p_epistemic": Array(null_p_val_ep_np, dtype=np.float32),
-                        "null_p_evidence": Array(null_p_val_np, dtype=np.float32),
+                        "null_t_epistemic": Array(dnull_logits, dtype=np.float32),
+                        "null_t_evidence": Array(null_logits, dtype=np.float32),
+                        # "null_p_epistemic": Array(null_p_val_ep, dtype=np.float32),
+                        # "null_p_evidence": Array(null_p_val, dtype=np.float32),
 
                         # global test statistic and p-value
-                        "p_global": Array(p_val_np, dtype=np.float32)
+                        "p_global": Array(p_val, dtype=np.float32)
                     }
                 )
 
