@@ -272,6 +272,8 @@ class NRECCalibrator:
             model.load_state_dict(cp, strict=True)
             model = torch.compile(model, dynamic=True)
             self.ensemble.append(model)
+        
+        self.ensemble.eval()
         torch.cuda.empty_cache()
 
     def model_forward(self, model: NREC, lar, hpge = None):
