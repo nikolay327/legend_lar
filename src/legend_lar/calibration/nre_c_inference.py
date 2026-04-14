@@ -347,7 +347,11 @@ class NRECCalibrator:
         self.ev_ep_null_buffer, _ = self._get_null_buffer(self.ev_ep_null_dataloader, self.classical_classifier_ev_ep)
         self.glob_null_buffer, self.classical_classifier_glob_buffer = self._get_null_buffer(self.glob_null_dataloader, self.classical_classifier_glob)
 
-        torch.cuda.empty_cache()
+        self.classical_classifier_glob_buffer = torch.as_tensor(
+            self.classical_classifier_glob_buffer,
+            device=self.device,
+            dtype=torch.bool
+        )
 
     def unpack_hpge_nrec_data(
         self,
@@ -366,244 +370,309 @@ class NRECCalibrator:
 
         return x
 
-    @torch.no_grad()
+    def _right_tail_pval_from_sorted(self, sorted_ref: Tensor, values: Tensor, add_one: bool = True):
+        """
+            sorted_ref: (B, N), ascending
+            values: (B,)
+            returns: (B,)
+            p = P(null >= value)
+        """
+        N = sorted_ref.shape[-1]
+        idx = torch.searchsorted(sorted_ref, values.unsqueeze(-1), right=False) # (B, 1)
+        num = (N - idx).to(values.dtype)
+        den = float(N)
+
+        if add_one:
+            num = num + 1.0
+            den = float(N + 1)
+
+        return (num / den).squeeze(-1)
+    
+    def _left_tail_pval_from_sorted(self, sorted_ref: Tensor, values: Tensor, add_one: bool = True):
+        """
+            sorted_ref: (B, N), ascending
+            values: (B,)
+            returns: (B,)
+            p = P(null <= value)
+        """
+        N = sorted_ref.shape[-1]
+        idx = torch.searchsorted(sorted_ref, values.unsqueeze(-1), right=True)  # (B, 1)
+        num = idx.to(values.dtype)
+        den = float(N)
+
+        if add_one:
+            num = num + 1.0
+            den = float(N + 1)
+
+        return (num / den).squeeze(-1)
+    
+    def _chunked_right_tail_matrix_pvals(self, sorted_ref: Tensor, values: Tensor, add_one: bool = False):
+        """
+            sorted_ref: (B, N_ref), ascending
+            values: (B, N_val)
+            returns: (B, N_val)
+            p = P(ref >= value)
+        """
+        N = sorted_ref.shape[-1]
+        out = []
+
+        for start in range(0, values.shape[-1], self.batch_size):
+            batch = values[:, start:start + self.batch_size]
+            idx = torch.searchsorted(sorted_ref, batch, right=False)
+            p = (N - idx).to(values.dtype)
+
+            if add_one:
+                p = (p + 1.0) / float(N + 1)
+            else:
+                p = p / float(N)
+
+            out.append(p)
+
+        return torch.cat(out, dim=-1)
+    
+    def _chunked_left_tail_matrix_pvals(self, sorted_ref: Tensor, values: Tensor, add_one: bool = False):
+        """
+            sorted_ref:(B, N_ref), ascending
+            values: (B, N_val)
+            returns: (B, N_val)
+            p = P(ref <= value)
+        """
+        N = sorted_ref.shape[-1]
+        out = []
+
+        for start in range(0, values.shape[-1], self.batch_size):
+            batch = values[:, start:start + self.batch_size]
+            idx = torch.searchsorted(sorted_ref, batch, right=True)
+            p = idx.to(values.dtype)
+
+            if add_one:
+                p = (p + 1.0) / float(N + 1)
+            else:
+                p = p / float(N)
+
+            out.append(p)
+
+        return torch.cat(out, dim=-1)
+
+    @torch.inference_mode()
     def infer_fold(self, fid: int):
         self.load_ensemble(fid)
         self._set_null_buffers()
         self.phy_dataloader.dataset.set_fold_id(fid)
+
         for (lar, hpge), indices in self.phy_dataloader:
             # Calculate the test statistic of each event
-            logits, dlogits, e_hpge = self.ensemble_forward(lar, hpge) # (B,), (B,), (n_ensemble, B, D)
+            logits, dlogits, e_hpge = self.ensemble_forward(lar, hpge)  # (B,), (B,), (n_ensemble, B, D)
+            device = logits.device
 
             # Calculate the evidence test statistic under the null for each event
             null_logits = []
             for e_null in self.ev_ep_null_buffer:
                 null_logits.append(
-                    torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp # (n_ensemble, B, B_rc)
+                    torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp  # (n_ensemble, B, B_rc)
                 )
-            null_logits = torch.cat(null_logits, dim=-1) # (n_ensemble, B, N_null)
-            dnull_logits = torch.var(null_logits, dim=0) # (B, N_null)
-            null_logits = null_logits.mean(dim=0) # (B, N_null)
-
-            # Calculate the evidence test statistic under the global null for each event
-            glob_null_logits = []
-            for e_null in self.glob_null_buffer:
-                glob_null_logits.append(
-                    torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp # (n_ensemble, B, B_rc)
-                )
-
-            glob_null_logits = torch.cat(glob_null_logits, dim=-1) # (n_ensemble, B, N_glob_null)
-            dglob_null_logits = torch.var(glob_null_logits, dim=0) # (B, N_glob_null)
-            glob_null_logits = glob_null_logits.mean(dim=0) # (B, N_glob_null)
-
-            N_rc_data = null_logits.shape[1]
-            # Evidence p-value
-            p_val = ((null_logits >= logits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
-            p_val = p_val.cpu().numpy()
-            # Epistemic p-value
-            p_val_ep = ((dnull_logits >= dlogits.reshape(-1, 1)).float().sum(dim=-1) + 1) / (N_rc_data + 1) # (B,)
-            p_val_ep = p_val_ep.cpu().numpy()
+            null_logits = torch.cat(null_logits, dim=-1)  # (n_ensemble, B, N_null)
+            dnull_logits = torch.var(null_logits, dim=0)  # (B, N_null)
+            null_logits = null_logits.mean(dim=0)  # (B, N_null)
 
             # Calculate the evidence and epistemic p-val under the null (for sanity check)
-            sorted_null = null_logits.sort(dim=-1).values.cpu() # (B, N_null)
-            null_logits = null_logits.cpu().numpy() # want to release
+            sorted_null = null_logits.sort(dim=-1).values  # (B, N_null)
+            sorted_dnull_logits = dnull_logits.sort(dim=-1).values  # (B, N_null)
 
-            sorted_dnull_logits = dnull_logits.sort(dim=-1).values.cpu() # (B, N_null)
-            dnull_logits = dnull_logits.cpu().numpy()
+            # Evidence p-value
+            p_val = self._right_tail_pval_from_sorted(sorted_null, logits, add_one=True)  # (B,)
+            # Epistemic p-value
+            p_val_ep = self._right_tail_pval_from_sorted(sorted_dnull_logits, dlogits, add_one=True)  # (B,)
 
-            null_logits_len = null_logits.shape[1]
-            num_iters = math.ceil(null_logits_len / self.batch_size)
-    
-            null_p_val = []
-            null_p_val_ep = []
-            for it in range(num_iters):
-                # (B, local_batch_size)
-                batch = null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > null_logits_len else null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
-                batch = torch.tensor(batch)
-                idx = torch.searchsorted(sorted_null, batch, right=False) # (B, N_null)
-                null_p_val_ = (null_logits_len - idx).float() / null_logits_len # leave-one-out formula
-                null_p_val.append(null_p_val_)
+            null_p_val = self._chunked_right_tail_matrix_pvals(
+                sorted_null, null_logits, add_one=False
+            )  # (B, N_null)
+            null_p_val_ep = self._chunked_right_tail_matrix_pvals(
+                sorted_dnull_logits, dnull_logits, add_one=False
+            )  # (B, N_null)
 
-                batch = dnull_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > null_logits_len else dnull_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
-                batch = torch.tensor(batch)
-                idx = torch.searchsorted(sorted_dnull_logits, batch, right=False) # (B, N_null)
-                null_p_val_ = (null_logits_len - idx).float() / null_logits_len # leave-one-out formula
-                null_p_val_ep.append(null_p_val_)
+            is_lar_vetoed = torch.as_tensor(
+                self.classical_classifier_phy[indices],
+                device=device,
+                dtype=torch.bool
+            )
 
-            null_p_val_ = None
-            idx = None
-            batch = None
-
-            null_p_val = torch.cat(null_p_val, dim=-1).cpu().numpy() # (B, N_null)
-            null_p_val_ep = torch.cat(null_p_val_ep, dim=-1).cpu().numpy() # (B, N_null)
-
-            is_lar_vetoed = self.classical_classifier_phy[indices]
             if self.data_config["alpha_epistemic"] > 0:
+                # Calculate the evidence test statistic under the global null for each event
+                glob_null_logits = []
+                for e_null in self.glob_null_buffer:
+                    glob_null_logits.append(
+                        torch.einsum('ebd,erd->ebr', e_hpge, e_null) * self.inv_temp  # (n_ensemble, B, B_rc)
+                    )
+
+                glob_null_logits = torch.cat(glob_null_logits, dim=-1)  # (n_ensemble, B, N_glob_null)
+                dglob_null_logits = torch.var(glob_null_logits, dim=0)  # (B, N_glob_null)
+                glob_null_logits = glob_null_logits.mean(dim=0)  # (B, N_glob_null)
+
                 # Calculate the evidence and epistemic p-val under the global null (for t_global calibration)
-                glob_null_logits = glob_null_logits.cpu().numpy() # want to release
-                dglob_null_logits = dglob_null_logits.cpu().numpy()
-
-                glob_null_logits_len = glob_null_logits.shape[1]
-                num_iters = math.ceil(glob_null_logits_len / self.batch_size)
-        
-                glob_null_p_val = []
-                glob_null_p_val_ep = []
-                for it in range(num_iters):
-                    # (B, local_batch_size)
-                    batch = glob_null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_logits_len else glob_null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
-                    batch = torch.tensor(batch)
-                    idx = torch.searchsorted(sorted_null, batch, right=False) # (B, N_glob_null)
-                    null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
-                    glob_null_p_val.append(null_p_val_)
-
-                    batch = dglob_null_logits[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_logits_len else dglob_null_logits[:, it*self.batch_size: (it + 1)*self.batch_size]
-                    batch = torch.tensor(batch)
-                    idx = torch.searchsorted(sorted_dnull_logits, batch, right=False) # (B, N_glob_null)
-                    null_p_val_ = ((null_logits_len - idx).float() + 1) / (null_logits_len + 1)
-                    glob_null_p_val_ep.append(null_p_val_)
-
-                null_p_val_ = None
-                idx = None
-                batch = None
-
-                glob_null_p_val = torch.cat(glob_null_p_val, dim=-1).cpu().numpy() # (B, N_glob_null)
-                glob_null_p_val_ep = torch.cat(glob_null_p_val_ep, dim=-1).cpu().numpy() # (B, N_glob_null)
+                glob_null_p_val = self._chunked_right_tail_matrix_pvals(
+                    sorted_null, glob_null_logits, add_one=True
+                )  # (B, N_glob_null)
+                glob_null_p_val_ep = self._chunked_right_tail_matrix_pvals(
+                    sorted_dnull_logits, dglob_null_logits, add_one=True
+                )  # (B, N_glob_null)
 
                 # Global score calculation of each event
-                indices = np.array(indices).astype(np.int64)
-                flag_classical = (p_val_ep <= self.data_config["alpha_epistemic"]) & is_lar_vetoed
-
+                alpha_ep = self.data_config["alpha_epistemic"]
                 eps = 1e-6
-                global_score = np.copy(p_val)
+                global_score = p_val.clone()
+                flag_classical = (p_val_ep <= alpha_ep) & is_lar_vetoed
+
                 global_score[flag_classical] = (
                     -1.0
-                    + (1.0 - 2.0 * eps) * (p_val_ep[flag_classical] / self.data_config["alpha_epistemic"])
+                    + (1.0 - 2.0 * eps) * (p_val_ep[flag_classical] / alpha_ep)
                     + eps * p_val[flag_classical]
-                ) # always reject untrustworthy scores that do not pass the classical classifier
+                )  # always reject untrustworthy scores that do not pass the classical classifier
 
                 # Global score calculation of global null
-                flag_classical = (glob_null_p_val_ep <= self.data_config["alpha_epistemic"]) & self.classical_classifier_glob_buffer
-                null_global_score = np.copy(glob_null_p_val)
+                flag_classical = (glob_null_p_val_ep <= alpha_ep) & self.classical_classifier_glob_buffer.unsqueeze(0)
+                null_global_score = glob_null_p_val.clone()
                 null_global_score[flag_classical] = (
                     -1.0
-                    + (1.0 - 2.0 * eps) * (glob_null_p_val_ep[flag_classical] / self.data_config["alpha_epistemic"])
+                    + (1.0 - 2.0 * eps) * (glob_null_p_val_ep[flag_classical] / alpha_ep)
                     + eps * glob_null_p_val[flag_classical]
                 )
 
                 # Global p-value
-                N_glob_null = null_global_score.shape[-1]
-                p_val_glob = ((null_global_score <= global_score.reshape(-1, 1)).sum(axis=-1) + 1) / (N_glob_null + 1) # (B,)
+                sorted_null_global = null_global_score.sort(dim=-1).values  # (B, N_glob_null)
+                p_val_glob = self._left_tail_pval_from_sorted(
+                    sorted_null_global, global_score, add_one=True
+                )  # (B,)
 
                 # Calculate the global p-val under the global null (for sanity check)
-                sorted_null = torch.tensor(null_global_score).sort(dim=-1).values # (B, N_glob_null)
-
-                glob_null_score_len = null_global_score.shape[1]
-                num_iters = math.ceil(glob_null_score_len / self.batch_size)
-        
-                glob_null_p_val_glob = []
-                for it in range(num_iters):
-                    # (B, local_batch_size)
-                    batch = null_global_score[:, it*self.batch_size:] if (it + 1)*self.batch_size > glob_null_score_len else null_global_score[:, it*self.batch_size: (it + 1)*self.batch_size]
-                    batch = torch.tensor(batch)
-                    idx = torch.searchsorted(sorted_null, batch, right=True) # (B, N_glob_null)
-                    null_p_val_ = idx.float() / glob_null_score_len # leave-one-out formula
-                    glob_null_p_val_glob.append(null_p_val_)
-
-                null_p_val_ = None
-                idx = None
-                batch = None
-
-                glob_null_p_val_glob = torch.cat(glob_null_p_val_glob, dim=-1).cpu().numpy() # (B, N_glob_null)
+                glob_null_p_val_glob = self._chunked_left_tail_matrix_pvals(
+                    sorted_null_global, null_global_score, add_one=False
+                )  # (B, N_glob_null)
 
             # retrieve HPGe observables
             (b_idx, f_idx, f_vals, _, _, geds_lengths) = hpge
+            b_idx = b_idx.to(device, non_blocking=True)
+            f_idx = f_idx.to(device, non_blocking=True)
+            f_vals = f_vals.to(device, non_blocking=True)
+            geds_lengths = geds_lengths.to(device, non_blocking=True)
+
             # NOTE: this part is hardcoded based on the data ordering from utils/create_base_dataset.py
-            geds_features = self.unpack_hpge_nrec_data(b_idx, f_idx, f_vals, geds_lengths) # (B, H)
-            geds_features = geds_features.cpu().numpy().astype(np.float32)
+            geds_features = self.unpack_hpge_nrec_data(b_idx, f_idx, f_vals, geds_lengths)  # (B, H)
+
+            hpge_feats_mean = self.config.hpge_feats_mean
+            hpge_feats_std = self.config.hpge_feats_std
 
             gid = geds_features[:, 0]
-            gid = gid * self.config.hpge_feats_std[0] + self.config.hpge_feats_mean[0]
+            gid = gid * hpge_feats_std[0] + hpge_feats_mean[0]
 
             energy = geds_features[:, 1]
-            energy = energy * self.config.hpge_feats_std[1] + self.config.hpge_feats_mean[1]
+            energy = energy * hpge_feats_std[1] + hpge_feats_mean[1]
 
             drift_time = geds_features[:, 2]
-            drift_time = drift_time * self.config.hpge_feats_std[2] + self.config.hpge_feats_mean[2]
+            drift_time = drift_time * hpge_feats_std[2] + hpge_feats_mean[2]
 
             aoe = geds_features[:, 3]
-            aoe = aoe * self.config.hpge_feats_std[3] + self.config.hpge_feats_mean[3]
+            aoe = aoe * hpge_feats_std[3] + hpge_feats_mean[3]
 
             lq = geds_features[:, 4]
-            lq = lq * self.config.hpge_feats_std[4] + self.config.hpge_feats_mean[4]
+            lq = lq * hpge_feats_std[4] + hpge_feats_mean[4]
 
             table_size = len(indices)
+
+            indices_np = np.array(indices).astype(np.float32)
+            gid_np = gid.float().cpu().numpy()
+            energy_np = energy.float().cpu().numpy()
+            drift_time_np = drift_time.float().cpu().numpy()
+            aoe_np = aoe.float().cpu().numpy()
+            lq_np = lq.float().cpu().numpy()
+
+            is_lar_vetoed_np = is_lar_vetoed.float().cpu().numpy()
+            logits_np = logits.float().cpu().numpy()
+            dlogits_np = dlogits.float().cpu().numpy()
+            p_val_np = p_val.float().cpu().numpy()
+            p_val_ep_np = p_val_ep.float().cpu().numpy()
+
+            null_logits_np = null_logits.float().cpu().numpy()
+            dnull_logits_np = dnull_logits.float().cpu().numpy()
+            null_p_val_np = null_p_val.float().cpu().numpy()
+            null_p_val_ep_np = null_p_val_ep.float().cpu().numpy()
+
             if self.data_config["alpha_epistemic"] > 0:
+                glob_null_logits_np = glob_null_logits.float().cpu().numpy()
+                dglob_null_logits_np = dglob_null_logits.float().cpu().numpy()
+                glob_null_p_val_np = glob_null_p_val.float().cpu().numpy()
+                glob_null_p_val_ep_np = glob_null_p_val_ep.float().cpu().numpy()
+                global_score_np = global_score.float().cpu().numpy()
+                p_val_glob_np = p_val_glob.float().cpu().numpy()
+                null_global_score_np = null_global_score.float().cpu().numpy()
+                glob_null_p_val_glob_np = glob_null_p_val_glob.float().cpu().numpy()
+
                 lgdo_table = Table(
                     size=table_size,
                     col_dict={
-                        "evt_idx": Array(indices.astype(np.float32)),
-                        "g_id": Array(gid, dtype=np.float32),
-                        "energy": Array(energy, dtype=np.float32),
-                        "drift_time": Array(drift_time, dtype=np.float32),
-                        "aoe": Array(aoe, dtype=np.float32),
-                        "lq": Array(lq, dtype=np.float32),
+                        "evt_idx": Array(indices_np),
+                        "g_id": Array(gid_np, dtype=np.float32),
+                        "energy": Array(energy_np, dtype=np.float32),
+                        "drift_time": Array(drift_time_np, dtype=np.float32),
+                        "aoe": Array(aoe_np, dtype=np.float32),
+                        "lq": Array(lq_np, dtype=np.float32),
 
-                        "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
+                        "is_lar_vetoed": Array(is_lar_vetoed_np, dtype=np.float32),
 
                         # evidence and epistemic test statistics and p-values
-                        "t_epistemic": Array(dlogits.cpu().numpy(), dtype=np.float32),
-                        "t_evidence": Array(logits.cpu().numpy(), dtype=np.float32),
-                        "p_evidence": Array(p_val, dtype=np.float32),
-                        "p_epistemic": Array(p_val_ep, dtype=np.float32),
+                        "t_epistemic": Array(dlogits_np, dtype=np.float32),
+                        "t_evidence": Array(logits_np, dtype=np.float32),
+                        "p_evidence": Array(p_val_np, dtype=np.float32),
+                        "p_epistemic": Array(p_val_ep_np, dtype=np.float32),
 
                         # sanity checks (calibrationg null_t_evidence and null_t_epistemic with itself) --> uniformly distributed in (0, 1]
-                        "null_t_epistemic": Array(dnull_logits, dtype=np.float32),
-                        "null_t_evidence": Array(null_logits, dtype=np.float32),
-                        "null_p_epistemic": Array(null_p_val_ep, dtype=np.float32),
-                        "null_p_evidence": Array(null_p_val, dtype=np.float32),
+                        "null_t_epistemic": Array(dnull_logits_np, dtype=np.float32),
+                        "null_t_evidence": Array(null_logits_np, dtype=np.float32),
+                        "null_p_epistemic": Array(null_p_val_ep_np, dtype=np.float32),
+                        "null_p_evidence": Array(null_p_val_np, dtype=np.float32),
 
                         # global null evidence and epistemic test statistics and p-values (for global test statistic calibration)
-                        "glob_null_t_epistemic": Array(dglob_null_logits, dtype=np.float32),
-                        "glob_null_t_evidence": Array(glob_null_logits, dtype=np.float32),
-                        "glob_null_p_epistemic": Array(glob_null_p_val_ep, dtype=np.float32),
-                        "glob_null_p_evidence": Array(glob_null_p_val, dtype=np.float32),
+                        "glob_null_t_epistemic": Array(dglob_null_logits_np, dtype=np.float32),
+                        "glob_null_t_evidence": Array(glob_null_logits_np, dtype=np.float32),
+                        "glob_null_p_epistemic": Array(glob_null_p_val_ep_np, dtype=np.float32),
+                        "glob_null_p_evidence": Array(glob_null_p_val_np, dtype=np.float32),
 
                         # global test statistic and p-value
-                        "t_global": Array(global_score, dtype=np.float32),
-                        "p_global": Array(p_val_glob, dtype=np.float32),
+                        "t_global": Array(global_score_np, dtype=np.float32),
+                        "p_global": Array(p_val_glob_np, dtype=np.float32),
 
                         # global null global test statistic and p-value for calibration and sanity check
-                        "glob_null_t_global": Array(null_global_score, dtype=np.float32),
-                        "glob_null_p_global": Array(glob_null_p_val_glob, dtype=np.float32)
+                        "glob_null_t_global": Array(null_global_score_np, dtype=np.float32),
+                        "glob_null_p_global": Array(glob_null_p_val_glob_np, dtype=np.float32)
                     }
                 )
             else:
                 lgdo_table = Table(
                     size=table_size,
                     col_dict={
-                        "evt_idx": Array(indices.astype(np.float32)),
-                        "g_id": Array(gid, dtype=np.float32),
-                        "energy": Array(energy, dtype=np.float32),
-                        "drift_time": Array(drift_time, dtype=np.float32),
-                        "aoe": Array(aoe, dtype=np.float32),
-                        "lq": Array(lq, dtype=np.float32),
+                        "evt_idx": Array(indices_np),
+                        "g_id": Array(gid_np, dtype=np.float32),
+                        "energy": Array(energy_np, dtype=np.float32),
+                        "drift_time": Array(drift_time_np, dtype=np.float32),
+                        "aoe": Array(aoe_np, dtype=np.float32),
+                        "lq": Array(lq_np, dtype=np.float32),
 
-                        "is_lar_vetoed": Array(is_lar_vetoed, dtype=np.float32),
+                        "is_lar_vetoed": Array(is_lar_vetoed_np, dtype=np.float32),
 
                         # evidence and epistemic test statistics and p-values
-                        "t_epistemic": Array(dlogits.cpu().numpy(), dtype=np.float32),
-                        "t_evidence": Array(logits.cpu().numpy(), dtype=np.float32),
-                        "p_evidence": Array(p_val, dtype=np.float32),
-                        "p_epistemic": Array(p_val_ep, dtype=np.float32),
+                        "t_epistemic": Array(dlogits_np, dtype=np.float32),
+                        "t_evidence": Array(logits_np, dtype=np.float32),
+                        "p_evidence": Array(p_val_np, dtype=np.float32),
+                        "p_epistemic": Array(p_val_ep_np, dtype=np.float32),
 
                         # sanity checks (calibrationg null_t_evidence and null_t_epistemic with itself) --> uniformly distributed in (0, 1]
-                        "null_t_epistemic": Array(dnull_logits, dtype=np.float32),
-                        "null_t_evidence": Array(null_logits, dtype=np.float32),
-                        "null_p_epistemic": Array(null_p_val_ep, dtype=np.float32),
-                        "null_p_evidence": Array(null_p_val, dtype=np.float32),
+                        "null_t_epistemic": Array(dnull_logits_np, dtype=np.float32),
+                        "null_t_evidence": Array(null_logits_np, dtype=np.float32),
+                        "null_p_epistemic": Array(null_p_val_ep_np, dtype=np.float32),
+                        "null_p_evidence": Array(null_p_val_np, dtype=np.float32),
 
                         # global test statistic and p-value
-                        "p_global": Array(p_val, dtype=np.float32)
+                        "p_global": Array(p_val_np, dtype=np.float32)
                     }
                 )
 
@@ -622,7 +691,7 @@ class NRECCalibrator:
                 n_rows=table_size,
                 wo_mode="append"
             )
-        
+
         self.ev_ep_null_buffer = None
         self.glob_null_buffer = None
 
