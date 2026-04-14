@@ -640,6 +640,7 @@ class NRECCalibrator:
 
         for fid in range(self.config.num_folds):
             self.infer_fold(fid)
+            print('Done with fid{fid:02d}'.format(fid=fid))
 
         torch.cuda.empty_cache()
 
