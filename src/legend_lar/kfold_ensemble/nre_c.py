@@ -145,6 +145,51 @@ class NRECTrainer(TrainerBase):
         loss = 1.0/(1.0+self.config.gamma)*loss_y0 + self.config.gamma/(1.0+self.config.gamma)*loss_y_not0
         return loss
     
+    def calculate_mirrored_loss(self, scores: Tensor, K: int):
+        """
+            Mirrored NRE-C loss for:
+                p(X, g | y=0) = p(g) prod_i q(x_i)
+                p(X, g | y=k) = p(g) p(x_k | g) prod_{j != k} q(x_j)
+        """
+        gamma = float(self.config.gamma)
+        loggamma = 0.0 if gamma == 1.0 else math.log(gamma)
+        logK = math.log(K)
+
+        device = scores.device
+        dtype = scores.dtype
+        idx = torch.arange(K, device=device)
+
+        # q(x) candidate scores
+        neg_scores = scores[:K, :].transpose(0, 1).contiguous() # (K, K)
+
+        # positive scores
+        pos_block = scores[K:, :] # (K, K)
+        pos_scores = pos_block[idx, idx] # (K,)
+
+        # Dependent candidate sets
+        dep_scores = neg_scores.clone()
+        dep_scores[idx, idx] = pos_scores
+
+        # class 0
+        null_col = torch.full((K, 1), logK, device=device, dtype=dtype)
+
+        # y = 0
+        logits_y0 = torch.cat([null_col, neg_scores + loggamma], dim=1) # (K, K+1)
+        target_y0 = torch.zeros(K, dtype=torch.long, device=device)
+
+        # y != 0
+        logits_y1 = torch.cat([null_col, dep_scores + loggamma], dim=1) # (K, K+1)
+        target_y1 = idx + 1
+
+        loss_y0 = F.cross_entropy(logits_y0, target_y0)
+        loss_y1 = F.cross_entropy(logits_y1, target_y1)
+
+        loss = (
+            1.0 / (1.0 + gamma) * loss_y0
+            + gamma / (1.0 + gamma) * loss_y1
+        )
+        return loss
+    
     def forward_batch(
         self,
         f_idx: Tensor, # (N_valid,)
@@ -171,7 +216,7 @@ class NRECTrainer(TrainerBase):
 
         K = len(ge_cu_seqlens) - 1
         logits = (e_lar @ e_hpge.t()) / self.config.temperature # (B, B / 2)
-        loss = self.calculate_loss(logits, K)
+        loss = self.calculate_mirrored_loss(logits, K)
         return loss
 
     def train_batch(

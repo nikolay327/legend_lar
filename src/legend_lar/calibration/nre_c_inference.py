@@ -347,8 +347,6 @@ class NRECCalibrator:
         self.ev_ep_null_buffer, _ = self._get_null_buffer(self.ev_ep_null_dataloader, self.classical_classifier_ev_ep)
         self.glob_null_buffer, self.classical_classifier_glob_buffer = self._get_null_buffer(self.glob_null_dataloader, self.classical_classifier_glob)
 
-    
-
     def unpack_hpge_nrec_data(
         self,
         b_all: Tensor,
