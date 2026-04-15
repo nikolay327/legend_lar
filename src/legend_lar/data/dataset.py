@@ -81,7 +81,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         # NOTE: in evaluation mode (3), data is not chunked and is not bootstrapped
         self.fold_id = fold_id
         self.bootstrap_id = bootstrap_id
-        self.bootstrap_id_cache = None
+        self.bootstrap_state_cache = None
         self.epoch_id = epoch_id
 
         self.data_lengths = lar_data_lengths
@@ -141,7 +141,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
     def _get_data_chunks_cumsum(self, data_len: int, chunk_fractions: list[float] = None):
         if chunk_fractions is None:
-            return np.array(0, data_len, dtype=np.int64)
+            return np.arange(0, data_len, dtype=np.int64)
         chunk_lens = [0]
         for i, chunk_fraction in enumerate(chunk_fractions):
             if i == len(chunk_fractions) - 1:
@@ -159,23 +159,16 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
             assert len(self.data_lengths) == 2
             # label 0 data (sg / RC dataset) is treated to have 1 fold
             sg_data_cumsum = self._get_data_chunks_cumsum(int(self.data_lengths[0]), [1.0, 0.0])
+
             # label 1 data with k folds (bg / physics)
             permuted_indices = np.array(self.mixed_indices[1], dtype=np.int64)
-            num_data_within_folds = len(permuted_indices) // self.num_folds
-            is_incomplete_last_fold = num_data_within_folds * self.num_folds != len(permuted_indices)
-            test_folds = permuted_indices[:num_data_within_folds * self.num_folds]
-            test_folds = test_folds.reshape(self.num_folds, -1).tolist()
-            if is_incomplete_last_fold:
-                last_fold = np.concatenate([test_folds[-1], permuted_indices[num_data_within_folds * self.num_folds:]], axis=0)
-                test_folds[-1] = last_fold.tolist()
+            test_folds = [fold.tolist() for fold in np.array_split(permuted_indices, self.num_folds)]
 
             bg_train_and_val_folds = []
             for test_fold in test_folds:
-                mask = np.ones(len(permuted_indices)).astype(np.bool_)
-                mask[test_fold] = False
-                bg_train_and_val_folds.append(
-                    permuted_indices[mask].tolist()
-                )
+                test_fold = np.array(test_fold, dtype=np.int64)
+                mask = ~np.isin(permuted_indices, test_fold)
+                bg_train_and_val_folds.append(permuted_indices[mask].tolist())
 
             self.indices = {
                 "sg": {
@@ -226,10 +219,10 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         if mode_value != 0:
             return
 
-        if self.bootstrap_id.value == self.bootstrap_id_cache:
+        current_state = (int(self.fold_id.value), int(self.bootstrap_id.value))
+        if current_state == self.bootstrap_state_cache:
             return
-        else:
-            self.bootstrap_id_cache = self.bootstrap_id.value
+        self.bootstrap_state_cache = current_state
 
         bootstrap_rng = np.random.default_rng(self.bootstrap_rng_seed + self.num_folds*self.fold_id.value + self.bootstrap_id.value) # bootstrap rng is the same for each worker because randomness is controlled globally
 
@@ -264,6 +257,12 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         """
 
         mode_value = self.mode if isinstance(self.mode, int) else self.mode.value
+
+        if mode_value == 2:
+            self.indices = [
+                np.array(self.test_folds[int(self.fold_id.value)], dtype=np.float32)
+            ]
+
         if mode_value == 0:
             seed = self.global_rng_seed_for_sampling + self.num_folds*self.fold_id.value + self.bootstrap_id.value
             seed = seed + self.epoch_id.value

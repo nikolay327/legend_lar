@@ -1,6 +1,5 @@
 import os
 import math
-from pathlib import Path
 
 import numpy as np
 from numpy.lib.format import open_memmap
@@ -119,6 +118,7 @@ class NRECTrainer(TrainerBase):
 
         self.train_loss = cp["train_loss"]
         self.val_loss = cp["val_loss"]
+        self.best_val_loss = cp.get("best_val_loss", cp["val_loss"][-1])
 
     def calculate_loss(self, logits: Tensor, K: int):
         logK = math.log(K)
@@ -331,8 +331,7 @@ def train(
         if len(meta) == 3:
             meta = np.array(meta).astype(int)
             global_id = model_cfg.num_bootstraps_per_fold * meta[0] + meta[1]
-            if meta[-1] != 1:
-                to_be_trained[global_id, -1] = meta[-1] + 1
+            to_be_trained[global_id, -1] = meta[-1] + 1
         elif len(meta) == 4:
             meta = np.array(meta[:3]).astype(int)
             global_id = model_cfg.num_bootstraps_per_fold * meta[0] + meta[1]

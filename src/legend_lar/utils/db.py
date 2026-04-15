@@ -54,23 +54,42 @@ class FileDB:
             str: A glob-compatible pattern string.
         """
 
-        fmt = self.cfg['file_format'][tier]
+        fmt = self.cfg["file_format"][tier]
+        parts = []
 
-        # collect all placeholders in the format string
-        all_keys = {p[1] for p in Formatter().parse(fmt) if p[1]}
-        # map provided keys to strings or '*' if None
-        sub = {k: (v if v is not None else '*') 
-               for k,v in kw.items()}
-        # ensure every placeholder has a substitution
-        for k in all_keys:
-            sub.setdefault(k, '*')
+        known_fields = set()
+
+        for literal_text, field_name, format_spec, _ in Formatter().parse(fmt):
+            parts.append(literal_text)
+
+            if field_name is None:
+                continue
+
+            known_fields.add(field_name)
+
+            if field_name in kw and kw[field_name] is not None:
+                value = kw[field_name]
+                if format_spec:
+                    parts.append(format(value, format_spec))
+                else:
+                    parts.append(str(value))
+            else:
+                if format_spec and format_spec.endswith("d"):
+                    m = re.fullmatch(r"0?(\d+)d", format_spec)
+                    if m:
+                        width = int(m.group(1))
+                        parts.append("?" * width)
+                    else:
+                        parts.append("*")
+                else:
+                    parts.append("*")
 
         if overload:
-            for k in sub.keys():
-                if k not in all_keys:
-                    fmt += "/{" + f"{k}" + "}"
+            for k, v in kw.items():
+                if k not in known_fields:
+                    parts.append(f"/{v if v is not None else '*'}")
 
-        return fmt.format(**sub)
+        return "".join(parts)
     
     def build_file(self, tier: str, **kwargs):
         base_dir = Path(self.cfg['tier_dirs'][tier])

@@ -161,7 +161,8 @@ class TrainerBase(ABC):
             "model_opt": self.model_opt.state_dict(),
 
             "train_loss": self.train_loss,
-            "val_loss": self.val_loss
+            "val_loss": self.val_loss,
+            "best_val_loss": self.best_val_loss
         }, save_path)
 
     @abstractmethod
@@ -215,7 +216,7 @@ class TrainerBase(ABC):
         self.current_fid = fid
         self.current_bid = bid
 
-        self.dataloader.dataset.set_fold_id(bid)
+        self.dataloader.dataset.set_fold_id(fid)
         self.dataloader.dataset.set_bootstrap_id(bid)
         self.reset_model_and_optimizer(fid, bid, start_from_epoch)
 
