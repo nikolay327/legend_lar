@@ -108,7 +108,7 @@ class TrainerBase(ABC):
             dataset=self.dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=16,
+            num_workers=8,
             pin_memory=False,
             prefetch_factor=2,
             persistent_workers=True,
