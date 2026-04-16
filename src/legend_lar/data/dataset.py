@@ -228,7 +228,8 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
         sg_fold = np.array(self.indices["sg"]["train_val"])
         n_sg = len(sg_fold)
-        sg_boot_idx = bootstrap_rng.choice(n_sg, size=n_sg, replace=True)
+        k_sg = math.ceil(0.8 * n_sg)
+        sg_boot_idx = bootstrap_rng.choice(n_sg, size=k_sg, replace=False)
         sg_inbag_unique = np.unique(sg_boot_idx)
         sg_oob_mask = np.ones(n_sg, dtype=np.bool_)
         sg_oob_mask[sg_inbag_unique] = False
@@ -239,7 +240,8 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
 
         bg_fold = np.array(self.indices["bg"]["train_val"]['fold_{i}'.format(i=int(self.fold_id.value))])
         n_bg = len(bg_fold)
-        bg_boot_idx = bootstrap_rng.choice(n_bg, size=n_bg, replace=True)
+        k_bg = math.ceil(0.8 * n_bg)
+        bg_boot_idx = bootstrap_rng.choice(n_bg, size=k_bg, replace=False)
         bg_inbag_unique = np.unique(bg_boot_idx)
         bg_oob_mask = np.ones(n_bg, dtype=np.bool_)
         bg_oob_mask[bg_inbag_unique] = False
@@ -329,7 +331,6 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                     gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 1), dtype=np.float32)
             indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
             yield batch, gE, indices
-
 
 def ParallelKFoldBootstrap_worker_init_fn(hpge_dataset, lar_datasets, worker_id: int):
     """
