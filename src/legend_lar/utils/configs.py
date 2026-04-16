@@ -15,6 +15,7 @@ class NRECConfig:
     num_bootstraps_per_fold: int = None
 
     # NRE-C toggle
+    K: int = None
     gamma: int = None
     temperature: float = None
 

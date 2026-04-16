@@ -189,16 +189,42 @@ class NRECTrainer(TrainerBase):
             + gamma / (1.0 + gamma) * loss_y1
         )
         return loss
-    
+
+    def calculate_loss(self, logits: Tensor, K: int):
+        G = logits.shape[0]
+
+        logits = torch.cat(
+            [
+                torch.full((G, 2 * K, 1), math.log(K), device=logits.device, dtype=logits.dtype),
+                logits + (0.0 if self.config.gamma == 1 else math.log(self.config.gamma))
+            ],
+            dim=-1
+        ) # (G, 2K, K+1)
+
+        loss_y0 = F.cross_entropy(
+            logits[:, :K].reshape(G * K, K + 1),
+            torch.zeros(G * K, dtype=torch.long, device=logits.device)
+        )
+
+        loss_y_not0 = F.cross_entropy(
+            logits[:, K:].reshape(G * K, K + 1),
+            torch.arange(K, device=logits.device).unsqueeze(0).expand(G, K).reshape(G * K) + 1
+        )
+
+        return (
+            1.0 / (1.0 + self.config.gamma) * loss_y0
+            + self.config.gamma / (1.0 + self.config.gamma) * loss_y_not0
+        )
+
     def forward_batch(
         self,
-        f_idx: Tensor, # (N_valid,)
-        f_vals: Tensor, # (N_valid,)
-        ge_cu_seqlens: Tensor, # (B/2+1,)
+        f_idx: Tensor,  # (N_valid,)
+        f_vals: Tensor,  # (N_valid,)
+        ge_cu_seqlens: Tensor,  # (B/2+1,)
         ge_max_seqlen: int,
-        t_idx: Tensor, # (N,)
-        s_idx: Tensor, # (N,)
-        cu_seqlens: Tensor, # (B+1,)
+        t_idx: Tensor,  # (N,)
+        s_idx: Tensor,  # (N,)
+        cu_seqlens: Tensor,  # (B+1,)
         max_seqlen: int
     ):
         e_lar, e_hpge = self.model(
@@ -211,13 +237,29 @@ class NRECTrainer(TrainerBase):
             ge_cu_seqlens=ge_cu_seqlens,
             ge_max_seqlen=ge_max_seqlen
         )
-        e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1) # (B / 2, D)
 
-        K = len(ge_cu_seqlens) - 1
-        logits = (e_lar @ e_hpge.t()) / self.config.temperature # (B, B / 2)
-        loss = self.calculate_mirrored_loss(logits, K)
-        return loss
+        e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
+        e_hpge = F.normalize(e_hpge, p=2, dim=-1) # (B/2, D)
+
+        K = self.config.K
+        G = (len(ge_cu_seqlens) - 1) // K
+        D = e_lar.shape[-1]
+
+        logits = torch.cat(
+            [
+                torch.bmm(
+                    e_lar[:G * K].reshape(G, K, D),
+                    e_hpge.reshape(G, K, D).transpose(1, 2)
+                ),
+                torch.bmm(
+                    e_lar[G * K:].reshape(G, K, D),
+                    e_hpge.reshape(G, K, D).transpose(1, 2)
+                )
+            ],
+            dim=1
+        ) / self.config.temperature # (G, 2K, K)
+
+        return self.calculate_loss(logits, K)
 
     def train_batch(
         self, *args, **kwargs
