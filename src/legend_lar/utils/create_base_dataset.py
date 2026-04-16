@@ -69,7 +69,7 @@ def create_base_dataset(
     sipm_data_sparse_fp = file_db.build_file(
         tier="dataset",
         partition="p16",
-        filename="sipm_data_sparse_phy.npz"
+        filename="sipm_data_sparse_fp.npz"
     )
     sipm_data_sparse_fp = load_npz(sipm_data_sparse_fp)
     indices = rng.permutation(sipm_data_sparse_fp.shape[0])
