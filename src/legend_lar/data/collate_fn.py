@@ -6,10 +6,12 @@ class NRECCollateFn:
     def __init__(
         self,
         cls_placeholder_id: int,
+        has_cls: bool = True,
         cuda_device: str = "cpu",
         **kwargs
     ):
         self.cls_placeholder_id = cls_placeholder_id
+        self.has_cls = has_cls
         self.device = "cpu"
         self.cuda_device = cuda_device
         self._device_set = False
@@ -25,7 +27,7 @@ class NRECCollateFn:
         gE = torch.from_numpy(gE).to(dtype=torch.float32)
 
         b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_nrec_data(x, cls_placeholder_id=self.cls_placeholder_id)
-        ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths = pack_hpge_nrec_data(gE, cls_placeholder_id=self.cls_placeholder_id)
+        ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths = pack_hpge_nrec_data(gE, cls_placeholder_id=self.cls_placeholder_id, has_cls=self.has_cls)
         return (
             (
                 b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32),

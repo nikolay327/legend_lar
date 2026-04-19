@@ -3,7 +3,7 @@ from torch import Tensor
 
 from legend_lar.utils import NRECConfig
 from legend_lar.model.tokenizer import GeometryTokenizer
-from legend_lar.model.encoder import LArEncoder, HPGeEncoder
+from legend_lar.model.encoder import LArEncoder, HPGeEncoder, CausalHPGeEncoder
 
 
 class NREC(nn.Module):
@@ -22,11 +22,18 @@ class NREC(nn.Module):
             device=device
         )
 
-        self.hpge_encoder = HPGeEncoder(
-            detector_coords=hpge_detector_coords,
-            config=config,
-            device=device
-        )
+        if config.deep_supervision == 0:
+            self.hpge_encoder = HPGeEncoder(
+                detector_coords=hpge_detector_coords,
+                config=config,
+                device=device
+            )
+        else:
+            self.hpge_encoder = CausalHPGeEncoder(
+                detector_coords=hpge_detector_coords,
+                config=config,
+                device=device
+            )
 
         self.geom_tokenizer = GeometryTokenizer(
             emb_dim=config.hidden_size,

@@ -226,3 +226,123 @@ class HPGeEncoder(nn.Module):
         tokens = self.proj_out(tokens)
 
         return tokens # (B, D)
+
+class CausalHPGeEncoder(nn.Module):
+    def __init__(
+        self,
+        detector_coords: Tensor,
+        config: NRECConfig,
+        device = None
+    ):
+        super(CausalHPGeEncoder, self).__init__()
+
+        self.config = config
+
+        self.geometry_table = DetectorGeometryFeatureTable(
+            detector_coords=detector_coords,
+            num_rz_bands=self.config.num_rz_bands,
+            max_freq_log2_rz=self.config.max_freq_log2_rz,
+            num_phi_harmonics=self.config.num_phi_harmonics
+        )
+        self.det_emb = nn.Embedding(self.config.num_hpges, self.config.hidden_size)
+        if self.config.subpartition_hpge_feats == 1:
+            self.partitioning_emb = nn.Embedding(self.config.hpge_global_partitioning_size, self.config.hidden_size)
+        else:
+            self.partitioning_emb = None
+
+        self.features_tokenizer = ContinuousFourierTokenizer(
+            emb_dim=self.config.hidden_size,
+            mlp_hidden_dim=self.config.intermediate_size,
+            num_bands=self.config.hpge_num_feat_bands,
+            max_freq_log2=self.config.hpge_feat_max_freq_log2
+        )
+
+        self.features_id_emb = nn.Embedding(self.config.hpge_num_features, self.config.hidden_size)
+
+        self.blocks = nn.ModuleList([
+            create_block(self.config, True) for _ in range(self.config.hpge_num_layers)
+        ])
+
+        self.norm = nn.LayerNorm(self.config.hidden_size)
+
+        self.proj_out = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.intermediate_size),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.config.intermediate_size, self.config.hidden_size)
+        )
+
+    def forward(
+        self,
+        f_idx: Tensor, # (N_valid,)
+        f_vals: Tensor, # (N_valid,)
+        cu_seqlens: Tensor, # (B+1,)
+        max_seqlen: int,
+        geom_tokenizer: GeometryTokenizer
+    ) -> Tensor:
+        device = self.features_id_emb.weight.device
+        dtype = self.features_id_emb.weight.dtype
+
+        gid_mask = f_idx == 0
+        if self.config.subpartition_hpge_feats == 1:
+            pid_mask = f_idx == 1
+            feat_mask = ~(gid_mask | pid_mask)
+            feats_start = 2
+
+            partitioning_emb = self.partitioning_emb(f_vals[pid_mask].to(torch.long))
+        else:
+            feat_mask = ~gid_mask
+            feats_start = 1
+            partitioning_emb = None
+
+        # detector hit tokenizer
+        gid = f_vals[gid_mask].to(torch.long)
+        r_tokens, phi_tokens, z_tokens = self.geometry_table(gid)
+        geom_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
+        # residual detectorwise-information
+        geom_tokens = geom_tokens + self.det_emb(gid)
+
+        # feature tokens
+        feat_emb = (
+            self.features_tokenizer(f_vals[feat_mask])
+            + self.features_id_emb(f_idx[feat_mask] - feats_start)
+        )
+
+        tokens = torch.empty(
+            f_idx.shape[0],
+            self.config.hidden_size,
+            device=device,
+            dtype=dtype
+        )
+
+        # gid token
+        gid_pos = gid_mask.nonzero(as_tuple=False).squeeze(-1)
+        tokens.index_copy_(0, gid_pos, geom_tokens)
+
+        # partitioning tokens
+        if self.config.subpartition_hpge_feats == 1:
+            pid_pos = pid_mask.nonzero(as_tuple=False).squeeze(-1)
+            tokens.index_copy_(0, pid_pos, partitioning_emb)
+
+        # feature tokens
+        feat_pos = feat_mask.nonzero(as_tuple=False).squeeze(-1)
+        tokens.index_copy_(0, feat_pos, feat_emb)
+
+        tokens = tokens.contiguous()
+
+        residual = None
+        for block in self.blocks:
+            tokens, residual = block(
+                hidden_states=tokens,
+                residual=residual,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+
+        tokens = self.norm(residual.float() + tokens.float())
+        tokens = self.proj_out(tokens)
+
+        if self.config.deep_supervision == 0:
+            last_pos = cu_seqlens[1:].to(torch.long) - 1 # (B,)
+            tokens = tokens.index_select(0, last_pos) # (B, D)
+
+        return tokens

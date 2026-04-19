@@ -19,11 +19,11 @@ def _create_mlp_cls(intermediate_size: int):
         hidden_dim=intermediate_size
     )
 
-def create_block(config: NRECConfig):
+def create_block(config: NRECConfig, causal: bool = False):
     mixer_cls = _create_mha_cls(
         num_attention_heads=config.num_attention_heads,
         attn_dropout=0.0 if config.attn_dropout is None else config.attn_dropout,
-        causal=False if config.causal is None else config.causal==1,
+        causal=causal
     )
     mlp_cls = _create_mlp_cls(config.intermediate_size)
 

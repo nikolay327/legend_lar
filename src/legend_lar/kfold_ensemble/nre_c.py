@@ -119,31 +119,6 @@ class NRECTrainer(TrainerBase):
         self.train_loss = cp["train_loss"]
         self.val_loss = cp["val_loss"]
         self.best_val_loss = cp.get("best_val_loss", cp["val_loss"][-1])
-
-    def calculate_loss(self, logits: Tensor, K: int):
-        logK = math.log(K)
-        loggamma = 0.0 if self.config.gamma == 1 else math.log(self.config.gamma)
-
-        logits = torch.cat(
-            [
-                torch.full((len(logits), 1), logK, device=logits.device),
-                logits + loggamma
-            ],
-            dim=1
-        ) # (B, K+1)
-
-        # y = 0
-        logits_y0 = logits[:-K]
-        target_y0 = torch.zeros(len(logits_y0), dtype=torch.long, device=logits.device)
-        loss_y0 = F.cross_entropy(logits_y0, target_y0)
-
-        # y != 0
-        logits_y_not0 = logits[-K:]
-        target_y_not0 = torch.arange(len(logits_y_not0), device=logits.device) + 1
-        loss_y_not0 = F.cross_entropy(logits_y_not0, target_y_not0)
-
-        loss = 1.0/(1.0+self.config.gamma)*loss_y0 + self.config.gamma/(1.0+self.config.gamma)*loss_y_not0
-        return loss
     
     def calculate_mirrored_loss(self, scores: Tensor, K: int):
         """

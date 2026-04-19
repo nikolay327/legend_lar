@@ -18,6 +18,8 @@ class NRECConfig:
     K: int = None
     gamma: int = None
     temperature: float = None
+    deep_supervision: int = None
+    alpha_t: list[float] = None
 
     # Transformer general config
     hidden_size: int = None
@@ -26,7 +28,6 @@ class NRECConfig:
     block_resid_dropout1: float = None
     block_resid_dropout2: float = None
     attn_dropout: float = None
-    causal: int = None
     cls_placeholder_id: int = None
 
     # Geometry table general config

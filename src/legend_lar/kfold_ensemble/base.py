@@ -72,6 +72,9 @@ class TrainerBase(ABC):
         self.train_loss = []
         self.val_loss = []
 
+        self.train_prefix_losses = []
+        self.val_prefix_losses = []
+
     def _init_dataloader(self, hpge_dataset, lar_datasets):
         self.mode_value = mp.Value("i", 0)
         self.fid_value = mp.Value("i", 0)
@@ -97,6 +100,7 @@ class TrainerBase(ABC):
         )
         self.collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
+            has_cls=self.config.deep_supervision==0,
             cuda_device=self.device
         )
         worker_init_fn = partial(
@@ -162,6 +166,8 @@ class TrainerBase(ABC):
 
             "train_loss": self.train_loss,
             "val_loss": self.val_loss,
+            "train_prefix_losses": self.train_prefix_losses,
+            "val_prefix_losses": self.val_prefix_losses,
             "best_val_loss": self.best_val_loss
         }, save_path)
 
