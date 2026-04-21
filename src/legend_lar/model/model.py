@@ -3,7 +3,7 @@ from torch import Tensor
 
 from legend_lar.utils import NRECConfig
 from legend_lar.model.tokenizer import GeometryTokenizer
-from legend_lar.model.encoder import LArEncoder, HPGeEncoder, CausalHPGeEncoder
+from legend_lar.model.encoder import LArEncoder, HPGeEncoder, CausalHPGeEncoder, UnbinnedLArEncoder
 
 
 class NREC(nn.Module):
@@ -16,20 +16,27 @@ class NREC(nn.Module):
     ):
         super(NREC, self).__init__()
 
-        self.lar_encoder = LArEncoder(
-            detector_coords=lar_detector_coords,
-            config=config,
-            device=device
-        )
+        if config.sipm_unbinned_pe == 1:
+            self.lar_encoder = UnbinnedLArEncoder(
+                detector_coords=lar_detector_coords,
+                config=config,
+                device=device
+            )
+        else:
+            self.lar_encoder = LArEncoder(
+                detector_coords=lar_detector_coords,
+                config=config,
+                device=device
+            )
 
-        if config.deep_supervision == 0:
-            self.hpge_encoder = HPGeEncoder(
+        if config.deep_supervision == 1:
+            self.hpge_encoder = CausalHPGeEncoder(
                 detector_coords=hpge_detector_coords,
                 config=config,
                 device=device
             )
         else:
-            self.hpge_encoder = CausalHPGeEncoder(
+            self.hpge_encoder = HPGeEncoder(
                 detector_coords=hpge_detector_coords,
                 config=config,
                 device=device
@@ -47,6 +54,7 @@ class NREC(nn.Module):
         self,
         t_idx: Tensor, # (N,)
         s_idx: Tensor, # (N,)
+        v_val: Tensor, # (N,)
         cu_seqlens: Tensor, # (B+1,)
         max_seqlen: int,
         f_idx: Tensor = None, # (N_valid,)
@@ -57,6 +65,7 @@ class NREC(nn.Module):
         e_lar = self.lar_encoder(
             t_idx=t_idx,
             s_idx=s_idx,
+            v_val=v_val,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             geom_tokenizer=self.geom_tokenizer

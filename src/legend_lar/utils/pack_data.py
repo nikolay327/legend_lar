@@ -61,6 +61,69 @@ def pack_nrec_data(x: Tensor, cls_placeholder_id: int, return_meta: bool = False
         return b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths, order
     else:
         return b_all, t_all, k_all, cu_seqlens, max_seqlen, lengths
+    
+@torch.no_grad()
+def pack_continuous_nrec_data(x: Tensor, cls_placeholder_id: int, return_meta: bool = False):
+    """
+    x: (B, T, S) p.e. values (float)
+        T-dimesion stores the time information, and the S-dimension stores the sipm id information.
+        Each entry in x[b] is the number of p.e.s sipm s at time t.
+    cls_placeholder_id: placeholder id used in the packed s_idx tensor for the CLS token
+    """
+    assert x.dim() == 3, f"Expected x to be (B, T, S), got {tuple(x.shape)}"
+    B, T, S = x.shape
+    device = x.device
+
+    # Indices of positive entries (b, t, s)
+    nz = (x > 0).nonzero(as_tuple=False) # (M, 3)
+
+    if nz.numel() > 0:
+        b_rep = nz[:, 0].to(torch.long) # (M,)
+        t_rep = nz[:, 1].to(torch.long) # (M,)
+        s_rep = nz[:, 2].to(torch.long) # (M,)
+        v_rep = x[b_rep, t_rep, s_rep] # (M,)
+    else:
+        b_rep = torch.empty((0,), device=device, dtype=torch.long)
+        t_rep = torch.empty((0,), device=device, dtype=torch.long)
+        s_rep = torch.empty((0,), device=device, dtype=torch.long)
+        v_rep = torch.empty((0,), device=device, dtype=x.dtype)
+
+    # Add one CLS placeholder token to every batch entry
+    b_cls = torch.arange(B, device=device, dtype=torch.long) # (B,)
+    t_cls = torch.zeros_like(b_cls) # placeholder only
+    s_cls = torch.full_like(b_cls, fill_value=cls_placeholder_id)
+    v_cls = torch.zeros(B, device=device, dtype=x.dtype) # placeholder only
+
+    b_all = torch.cat([b_rep, b_cls], dim=0)
+    t_all = torch.cat([t_rep, t_cls], dim=0)
+    s_all = torch.cat([s_rep, s_cls], dim=0)
+    v_all = torch.cat([v_rep, v_cls], dim=0)
+
+    if b_all.numel() == 0:
+        raise RuntimeError("No tokens produced (unexpected).")
+
+    # Sort by (b, is_not_cls, t, s) so CLS is first within each batch entry,
+    # and the remaining tokens are ordered by time then detector index.
+    is_not_cls = (s_all != cls_placeholder_id).to(torch.long)
+    s_sort = torch.where(is_not_cls.bool(), s_all, torch.zeros_like(s_all))
+    key = (((b_all * 2 + is_not_cls) * (T + 1) + t_all) * S + s_sort)
+    order = torch.argsort(key)
+
+    b_all = b_all[order]
+    t_all = t_all[order]
+    s_all = s_all[order]
+    v_all = v_all[order]
+
+    # cu_seqlens and max_seqlen for FlashAttention varlen
+    lengths = torch.bincount(b_all, minlength=B) # (B,)
+    cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.long)
+    cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+    max_seqlen = int(lengths.max().item())
+
+    if return_meta:
+        return b_all, t_all, s_all, v_all, cu_seqlens, max_seqlen, lengths, order
+    else:
+        return b_all, t_all, s_all, v_all, cu_seqlens, max_seqlen, lengths
 
 @torch.no_grad()
 def pack_hpge_nrec_data(
@@ -80,6 +143,12 @@ def pack_hpge_nrec_data(
     cls_placeholder_id: placeholder id used in the packed f_all tensor for the CLS token
     has_cls: if True, add one CLS placeholder token per batch entry; if False, do not add CLS tokens
     """
+
+    if x is None:
+        if return_meta:
+            return None, None, None, None, None, None, None
+        else:
+            return None, None, None, None, None, None
 
     assert x.dim() == 2, f"Expected x to be (B, H), got {tuple(x.shape)}"
     B, H = x.shape

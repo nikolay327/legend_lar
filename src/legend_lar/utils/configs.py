@@ -42,6 +42,9 @@ class NRECConfig:
     # LAr encoder
     num_sipms: int = None
     num_sipm_t_bins: int = None
+    sipm_unbinned_pe: int = None
+    sipm_num_feat_bands: int = None
+    sipm_feat_max_freq_log2: float = None
 
     sipm_num_layers: int = None
 
@@ -61,6 +64,8 @@ class NRECConfig:
     hpge_feats_mean: list[float] = None
     hpge_feats_std: list[float] = None
     subpartition_hpge_feats: int = None
+
+    sipm_pe_scale: float = 1.0
 
     # Training hyperparams
     local_batch_size: int = None

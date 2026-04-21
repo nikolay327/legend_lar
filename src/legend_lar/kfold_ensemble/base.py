@@ -88,6 +88,7 @@ class TrainerBase(ABC):
             batch_size=self.config.local_batch_size,
             hpge_feats_mean=self.config.hpge_feats_mean,
             hpge_feats_std=self.config.hpge_feats_std,
+            sipm_pe_scale=self.config.sipm_pe_scale,
             rng_seed_for_split=self.rng_seed_for_data_plit,
             times_of_mixing=self.config.times_of_mixing,
             bootstrap_rng_seed=self.rng_seed_for_bootstrap,
@@ -100,7 +101,8 @@ class TrainerBase(ABC):
         )
         self.collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
-            has_cls=self.config.deep_supervision==0,
+            has_cls=self.config.deep_supervision!=1,
+            sipm_unbinned_pe=self.config.sipm_unbinned_pe==1,
             cuda_device=self.device
         )
         worker_init_fn = partial(

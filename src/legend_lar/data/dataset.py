@@ -39,6 +39,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         batch_size: int,
         hpge_feats_mean: list[float] = None,
         hpge_feats_std: list[float] = None,
+        sipm_pe_scale: float = 1.0,
         test_folds: list[list[int]] = None,
         rng_seed_for_split: int = None,
         times_of_mixing: int = 5,
@@ -65,6 +66,7 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
         self.lar_datasets = None
         self.hpge_feats_mean = hpge_feats_mean
         self.hpge_feats_std = hpge_feats_std
+        self.sipm_pe_scale = sipm_pe_scale
 
         self.test_folds = test_folds # needed in evaluation mode
 
@@ -328,8 +330,11 @@ class ParallelBootstrappedKFoldLArListDataset(IterableDataset):
                 if self.hpge_dataset is not None:
                     gE = self.hpge_dataset[indices[-1]]
                 else:
-                    gE = np.zeros((len(batch), len(self.hpge_feats_mean) + 1), dtype=np.float32)
+                    gE = None
             indices = np.concatenate(indices, axis=0) if len(indices) > 1 else indices[0]
+
+            # scale the sipm pe values
+            batch = batch / self.sipm_pe_scale
             yield batch, gE, indices
 
 def ParallelKFoldBootstrap_worker_init_fn(hpge_dataset, lar_datasets, worker_id: int):

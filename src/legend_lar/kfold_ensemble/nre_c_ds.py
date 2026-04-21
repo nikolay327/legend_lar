@@ -202,18 +202,20 @@ class NRECTrainer(TrainerBase):
 
     def forward_batch(
         self,
-        f_idx: Tensor,  # (N_valid,)
-        f_vals: Tensor,  # (N_valid,)
-        ge_cu_seqlens: Tensor,  # (B/2+1,)
+        f_idx: Tensor, # (N_valid,)
+        f_vals: Tensor, # (N_valid,)
+        ge_cu_seqlens: Tensor, # (B/2+1,)
         ge_max_seqlen: int,
-        t_idx: Tensor,  # (N,)
-        s_idx: Tensor,  # (N,)
-        cu_seqlens: Tensor,  # (B+1,)
+        t_idx: Tensor, # (N,)
+        s_idx: Tensor, # (N,)
+        v_val: Tensor, # (N,)
+        cu_seqlens: Tensor, # (B+1,)
         max_seqlen: int
     ):
         e_lar, e_hpge = self.model(
             t_idx=t_idx,
             s_idx=s_idx,
+            v_val=v_val,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             f_idx=f_idx,
@@ -271,7 +273,7 @@ class NRECTrainer(TrainerBase):
         prefix_loss_count = [0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
 
         for (lar, hpge), _ in self.dataloader:
-            (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
+            (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
             (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
 
             loss_, prefix_losses_ = self.train_batch(
@@ -281,6 +283,7 @@ class NRECTrainer(TrainerBase):
                 ge_max_seqlen=int(ge_max_seqlen),
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
+                v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val,
                 cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 max_seqlen=int(max_seqlen)
             )
@@ -315,7 +318,7 @@ class NRECTrainer(TrainerBase):
         prefix_loss_count = [0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
 
         for (lar, hpge), _ in self.dataloader:
-            (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
+            (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
             (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
 
             loss_, prefix_losses_ = self.forward_batch(
@@ -325,6 +328,7 @@ class NRECTrainer(TrainerBase):
                 ge_max_seqlen=int(ge_max_seqlen),
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
+                v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val,
                 cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 max_seqlen=int(max_seqlen)
             )

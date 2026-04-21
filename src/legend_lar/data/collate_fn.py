@@ -1,17 +1,22 @@
 from typing import Tuple
 import torch
-from legend_lar.utils import pack_nrec_data, pack_hpge_nrec_data
+from legend_lar.utils import pack_nrec_data, pack_hpge_nrec_data, pack_continuous_nrec_data
 
 class NRECCollateFn:
     def __init__(
         self,
         cls_placeholder_id: int,
         has_cls: bool = True,
+        sipm_unbinned_pe: bool = False,
         cuda_device: str = "cpu",
         **kwargs
     ):
+        """
+        NOTE: LAr encoder always have a cls token. The has_cls arg only affects the HPGe encoder
+        """
         self.cls_placeholder_id = cls_placeholder_id
         self.has_cls = has_cls
+        self.sipm_unbinned_pe = sipm_unbinned_pe
         self.device = "cpu"
         self.cuda_device = cuda_device
         self._device_set = False
@@ -24,13 +29,19 @@ class NRECCollateFn:
     @torch.no_grad()
     def preprocess(self, x, gE, indices):
         x = torch.from_numpy(x).to(dtype=torch.float32)
-        gE = torch.from_numpy(gE).to(dtype=torch.float32)
+        gE = torch.from_numpy(gE).to(dtype=torch.float32) if gE is not None else None
 
-        b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_nrec_data(x, cls_placeholder_id=self.cls_placeholder_id)
+        if self.sipm_unbinned_pe:
+            b_idx, t_idx, s_idx, v_vals, cu_seqlens, max_seqlen, lengths = pack_continuous_nrec_data(x, cls_placeholder_id=self.cls_placeholder_id)
+        else:
+            b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths = pack_nrec_data(x, cls_placeholder_id=self.cls_placeholder_id)
+            v_vals = None
+
         ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths = pack_hpge_nrec_data(gE, cls_placeholder_id=self.cls_placeholder_id, has_cls=self.has_cls)
         return (
             (
                 b_idx.to(dtype=torch.float32), t_idx.to(dtype=torch.float32), s_idx.to(dtype=torch.float32),
+                v_vals.to(dtype=torch.float32) if v_vals is not None else None,
                 cu_seqlens.to(dtype=torch.float32), int(max_seqlen), lengths.to(dtype=torch.float32)
             ),
             (
@@ -43,23 +54,25 @@ class NRECCollateFn:
         self._set_worker_cuda()
 
         (
-            (b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths),
+            (b_idx, t_idx, s_idx, v_vals, cu_seqlens, max_seqlen, lengths),
             (ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths)
         ), indices = self.preprocess(*batch)
 
         b_idx = b_idx.pin_memory()
         t_idx = t_idx.pin_memory()
         s_idx = s_idx.pin_memory()
+        v_vals = v_vals.pin_memory() if v_vals is not None else None
         cu_seqlens = cu_seqlens.pin_memory()
         lengths = lengths.pin_memory()
 
-        ge_b_idx = ge_b_idx.pin_memory()
-        ge_f_idx = ge_f_idx.pin_memory()
-        ge_f_vals = ge_f_vals.pin_memory()
-        ge_cu_seqlens = ge_cu_seqlens.pin_memory()
-        ge_lengths = ge_lengths.pin_memory()
+        if ge_b_idx is not None:
+            ge_b_idx = ge_b_idx.pin_memory()
+            ge_f_idx = ge_f_idx.pin_memory()
+            ge_f_vals = ge_f_vals.pin_memory()
+            ge_cu_seqlens = ge_cu_seqlens.pin_memory()
+            ge_lengths = ge_lengths.pin_memory()
 
         return (
-            (b_idx, t_idx, s_idx, cu_seqlens, max_seqlen, lengths),
+            (b_idx, t_idx, s_idx, v_vals, cu_seqlens, max_seqlen, lengths),
             (ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths)
         ), indices

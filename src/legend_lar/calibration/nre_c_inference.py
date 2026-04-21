@@ -108,6 +108,7 @@ class NRECCalibrator:
             batch_size=self.batch_size,
             hpge_feats_mean=self.config.hpge_feats_mean,
             hpge_feats_std=self.config.hpge_feats_std,
+            sipm_pe_scale=self.config.sipm_pe_scale,
             test_folds=test_folds,
             mode=2,
             fold_id=self.fid_value
@@ -115,6 +116,8 @@ class NRECCalibrator:
 
         collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
+            has_cls=self.config.deep_supervision!=1,
+            sipm_unbinned_pe=self.config.sipm_unbinned_pe==1,
             cuda_device=self.device
         )
         worker_init_fn = partial(
@@ -156,12 +159,12 @@ class NRECCalibrator:
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
             batch_size=self.batch_size,
-            hpge_feats_mean=self.config.hpge_feats_mean,
-            hpge_feats_std=self.config.hpge_feats_std,
+            sipm_pe_scale=self.config.sipm_pe_scale,
             mode=3
         )
         collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
+            sipm_unbinned_pe=self.config.sipm_unbinned_pe==1,
             cuda_device=self.device
         )
         worker_init_fn = partial(
@@ -203,12 +206,12 @@ class NRECCalibrator:
             num_t_bins=self.config.num_sipm_t_bins,
             num_sipm_chs=self.config.num_sipms,
             batch_size=self.batch_size,
-            hpge_feats_mean=self.config.hpge_feats_mean,
-            hpge_feats_std=self.config.hpge_feats_std,
+            sipm_pe_scale=self.config.sipm_pe_scale,
             mode=3
         )
         collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
+            sipm_unbinned_pe=self.config.sipm_unbinned_pe==1,
             cuda_device=self.device
         )
         worker_init_fn = partial(
@@ -293,17 +296,16 @@ class NRECCalibrator:
 
         return e_hpge.index_select(0, starts + local_idx), local_idx
 
-    def model_forward(self, model: NREC, lar, hpge = None):
-        (_, t_idx, s_idx, cu_seqlens, max_seqlen, _) = lar
+    def model_forward(self, model: NREC, lar, hpge):
+        (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
         t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
         s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val
         cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
         max_seqlen=int(max_seqlen)
 
-        if hpge is None:
-            (f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths) = (None, None, None, None, None)
-        else:
-            (_, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths) = hpge
+        (_, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths) = hpge
+        if f_idx is not None:            
             f_idx=f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
             f_vals=f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
             ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
@@ -313,6 +315,7 @@ class NRECCalibrator:
         e_lar, e_hpge = model(
             t_idx=t_idx,
             s_idx=s_idx,
+            v_val=v_val,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             f_idx=f_idx,
@@ -322,8 +325,7 @@ class NRECCalibrator:
         )
         e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
 
-        if hpge is None:
-            e_hpge = None
+        if e_hpge is None:
             selected_t = None
         else:
             if self.config.deep_supervision == 1:
@@ -335,7 +337,7 @@ class NRECCalibrator:
 
         return e_lar, e_hpge, selected_t
 
-    def ensemble_forward(self, lar, hpge = None):
+    def ensemble_forward(self, lar, hpge):
         e_lar = []
         e_hpge = []
         logits = []
@@ -354,7 +356,7 @@ class NRECCalibrator:
                 logits.append(logits_.unsqueeze(0))
                 e_hpge.append(e_hpge_.unsqueeze(0))
 
-        if hpge is None:
+        if len(e_hpge) == 0:
             return torch.cat(e_lar, dim=0) # (n_ensemble, B, D)
         
         logits = torch.cat(logits, dim=0) # (n_ensemble, B)
@@ -368,8 +370,8 @@ class NRECCalibrator:
     def _get_null_buffer(self, dataloader, classical_classifier):
         buffer = []
         classical = []
-        for (lar, _), indices in dataloader:
-            e_lar = self.ensemble_forward(lar)
+        for (lar, hpge), indices in dataloader:
+            e_lar = self.ensemble_forward(lar, hpge)
             buffer.append(e_lar)
             classical.append(classical_classifier[indices])
         classical = np.concatenate(classical, axis=0)
