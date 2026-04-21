@@ -121,6 +121,8 @@ class NRECTrainer(TrainerBase):
 
         self.train_loss = cp["train_loss"]
         self.val_loss = cp["val_loss"]
+        self.train_prefix_losses = cp.get("train_prefix_losses", [])
+        self.val_prefix_losses = cp.get("val_prefix_losses", [])
         self.best_val_loss = cp.get("best_val_loss", cp["val_loss"][-1])
 
     def calculate_loss(self, logits: Tensor, K: int):
@@ -148,68 +150,113 @@ class NRECTrainer(TrainerBase):
             1.0 / (1.0 + self.config.gamma) * loss_y0
             + self.config.gamma / (1.0 + self.config.gamma) * loss_y_not0
         )
-    
     def calculate_deep_supervision_loss(
         self,
         e_lar: Tensor, # (2 * B_hpge, D)
         e_hpge: Tensor, # (N_packed, D)
-        ge_cu_seqlens: Tensor # (B_hpge + 1,)
+        ge_group_ex_idx: Tensor, # (Tprefix, Gmax, K)
+        ge_group_hpge_pos: Tensor, # (Tprefix, Gmax, K)
+        ge_group_valid: Tensor # (Tprefix, Gmax)
     ):
         K = self.config.K
-        B_hpge = ge_cu_seqlens.numel() - 1
-        G_full = B_hpge // K
+        B_hpge = e_lar.shape[0] // 2
         D = e_lar.shape[-1]
 
-        seq_starts = ge_cu_seqlens[:-1].to(torch.long)
-        seq_lengths = (ge_cu_seqlens[1:] - ge_cu_seqlens[:-1]).view(G_full, K)
-        k_idx = torch.arange(K, device=e_lar.device)
+        Tprefix, Gmax, _ = ge_group_ex_idx.shape
 
-        total_loss = e_lar.new_zeros(())
-        total_weight = 0.0
+        ge_group_ex_idx = ge_group_ex_idx.to(torch.long)
+        ge_group_hpge_pos = ge_group_hpge_pos.to(torch.long)
+        ge_group_valid = ge_group_valid.to(torch.bool)
 
-        prefix_losses = [math.nan] * (self.config.hpge_num_features + 1)
-        for t in range(self.config.hpge_num_features + 1): #NOTE: +1 hardcoded: no partition id
-            alpha = float(self.config.alpha_t[t])
-            if alpha == 0.0:
-                continue
+        alpha_t = torch.as_tensor(
+            self.config.alpha_t[:Tprefix],
+            device=e_lar.device,
+            dtype=e_lar.dtype
+        )  # (Tprefix,)
 
-            g_idx = ((seq_lengths > t).all(dim=1)).nonzero(as_tuple=True)[0]
-            if g_idx.numel() == 0:
-                continue
+        active_prefix = ge_group_valid.any(dim=1) & (alpha_t > 0)
+        if not active_prefix.any():
+            raise RuntimeError("No valid deep-supervision prefix groups were found in this batch.")
 
-            G_t = g_idx.numel()
-            seq_idx = (g_idx[:, None] * K + k_idx[None, :]).reshape(-1)
+        # Gather into fixed shapes
+        hpge_all = e_hpge[ge_group_hpge_pos] # (Tprefix, Gmax, K, D)
+        lar_y0_all = e_lar[ge_group_ex_idx] # (Tprefix, Gmax, K, D)
+        lar_y1_all = e_lar[ge_group_ex_idx + B_hpge] # (Tprefix, Gmax, K, D)
 
-            hpge_t = e_hpge[seq_starts[seq_idx] + t].view(G_t, K, D)
-            lar_y0 = e_lar[seq_idx].view(G_t, K, D)
-            lar_y1 = e_lar[seq_idx + B_hpge].view(G_t, K, D)
+        # Flatten prefix and group dims for big batched matmuls
+        TG = Tprefix * Gmax
+        hpge_all = hpge_all.view(TG, K, D)
+        lar_y0_all = lar_y0_all.view(TG, K, D)
+        lar_y1_all = lar_y1_all.view(TG, K, D)
 
-            logits_t = torch.cat(
-                [
-                    torch.bmm(lar_y0, hpge_t.transpose(1, 2)),
-                    torch.bmm(lar_y1, hpge_t.transpose(1, 2)),
-                ],
-                dim=1
-            ) / self.config.temperature
+        logits_y0 = torch.bmm(lar_y0_all, hpge_all.transpose(1, 2)) / self.config.temperature
+        logits_y1 = torch.bmm(lar_y1_all, hpge_all.transpose(1, 2)) / self.config.temperature
 
-            loss_t = self.calculate_loss(logits_t, K)
-            prefix_losses[t] = loss_t.detach().item()
+        logK = math.log(K)
+        loggamma = 0.0 if self.config.gamma == 1 else math.log(self.config.gamma)
 
-            total_loss = total_loss + alpha * loss_t
-            total_weight += alpha
+        null_col = torch.full((TG, K, 1), logK, device=e_lar.device, dtype=e_lar.dtype)
+        logits_y0 = torch.cat([null_col, logits_y0 + loggamma], dim=-1) # (TG, K, K+1)
+        logits_y1 = torch.cat([null_col, logits_y1 + loggamma], dim=-1) # (TG, K, K+1)
 
-        return total_loss / total_weight, prefix_losses
+        target_y0 = torch.zeros(TG * K, dtype=torch.long, device=e_lar.device)
+        target_y1 = torch.arange(K, device=e_lar.device).unsqueeze(0).expand(TG, K).reshape(TG * K) + 1
+
+        loss_y0_rows = F.cross_entropy(
+            logits_y0.reshape(TG * K, K + 1),
+            target_y0,
+            reduction="none"
+        ).view(Tprefix, Gmax, K)
+
+        loss_y1_rows = F.cross_entropy(
+            logits_y1.reshape(TG * K, K + 1),
+            target_y1,
+            reduction="none"
+        ).view(Tprefix, Gmax, K)
+
+        valid_f = ge_group_valid.to(e_lar.dtype) # (Tprefix, Gmax)
+        valid_rows = valid_f.unsqueeze(-1) # (Tprefix, Gmax, 1)
+
+        coeff_y0 = 1.0 / (1.0 + self.config.gamma)
+        coeff_y1 = self.config.gamma / (1.0 + self.config.gamma)
+
+        row_count = ge_group_valid.sum(dim=1).to(e_lar.dtype) * K # (Tprefix,)
+
+        prefix_losses_t = torch.full(
+            (Tprefix,),
+            float("nan"),
+            device=e_lar.device,
+            dtype=e_lar.dtype
+        )
+
+        sum_y0 = (loss_y0_rows * valid_rows).sum(dim=(1, 2)) # (Tprefix,)
+        sum_y1 = (loss_y1_rows * valid_rows).sum(dim=(1, 2)) # (Tprefix,)
+
+        prefix_losses_t[active_prefix] = (
+            coeff_y0 * (sum_y0[active_prefix] / row_count[active_prefix])
+            + coeff_y1 * (sum_y1[active_prefix] / row_count[active_prefix])
+        )
+
+        total_loss = (
+            alpha_t[active_prefix] * prefix_losses_t[active_prefix]
+        ).sum() / alpha_t[active_prefix].sum()
+
+        prefix_losses = prefix_losses_t.detach().cpu().tolist()
+        return total_loss, prefix_losses
 
     def forward_batch(
         self,
-        f_idx: Tensor, # (N_valid,)
-        f_vals: Tensor, # (N_valid,)
-        ge_cu_seqlens: Tensor, # (B/2+1,)
+        f_idx: Tensor,
+        f_vals: Tensor,
+        ge_cu_seqlens: Tensor,
         ge_max_seqlen: int,
-        t_idx: Tensor, # (N,)
-        s_idx: Tensor, # (N,)
-        v_val: Tensor, # (N,)
-        cu_seqlens: Tensor, # (B+1,)
+        ge_group_ex_idx: Tensor,
+        ge_group_hpge_pos: Tensor,
+        ge_group_valid: Tensor,
+        t_idx: Tensor,
+        s_idx: Tensor,
+        v_val: Tensor,
+        cu_seqlens: Tensor,
         max_seqlen: int
     ):
         e_lar, e_hpge = self.model(
@@ -224,8 +271,8 @@ class NRECTrainer(TrainerBase):
             ge_max_seqlen=ge_max_seqlen
         )
 
-        e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1) # (B/2, D)
+        e_lar = F.normalize(e_lar, p=2, dim=-1)
+        e_hpge = F.normalize(e_hpge, p=2, dim=-1)
 
         K = self.config.K
         if self.config.deep_supervision == 0:
@@ -244,14 +291,16 @@ class NRECTrainer(TrainerBase):
                     )
                 ],
                 dim=1
-            ) / self.config.temperature # (G, 2K, K)
+            ) / self.config.temperature
 
             return self.calculate_loss(logits, K), None
 
         return self.calculate_deep_supervision_loss(
             e_lar=e_lar,
             e_hpge=e_hpge,
-            ge_cu_seqlens=ge_cu_seqlens
+            ge_group_ex_idx=ge_group_ex_idx,
+            ge_group_hpge_pos=ge_group_hpge_pos,
+            ge_group_valid=ge_group_valid
         )
 
     def train_batch(
@@ -269,18 +318,28 @@ class NRECTrainer(TrainerBase):
         loss = 0.
         n_step = 0
 
-        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
-        prefix_loss_count = [0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
+        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
+        prefix_loss_count = [0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
-            (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
+            (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _, ge_group_meta) = hpge
+
+            if ge_group_meta is None:
+                ge_group_ex_idx = None
+                ge_group_hpge_pos = None
+                ge_group_valid = None
+            else:
+                ge_group_ex_idx, ge_group_hpge_pos, ge_group_valid = ge_group_meta
 
             loss_, prefix_losses_ = self.train_batch(
                 f_idx=ge_f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 f_vals=ge_f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 ge_max_seqlen=int(ge_max_seqlen),
+                ge_group_ex_idx=ge_group_ex_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long) if ge_group_ex_idx is not None else None,
+                ge_group_hpge_pos=ge_group_hpge_pos.to(device=self.device, non_blocking=True).to(dtype=torch.long) if ge_group_hpge_pos is not None else None,
+                ge_group_valid=ge_group_valid.to(device=self.device, non_blocking=True).to(dtype=torch.bool) if ge_group_valid is not None else None,
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val,
@@ -303,7 +362,7 @@ class NRECTrainer(TrainerBase):
         if self.config.deep_supervision == 1:
             self.train_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
-                for t in range(self.config.hpge_num_features + 1)
+                for t in range(len(prefix_loss_sum))
             ])
 
     def val_batch(self):
@@ -314,18 +373,28 @@ class NRECTrainer(TrainerBase):
         loss = 0.
         n_step = 0
 
-        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
-        prefix_loss_count = [0] * (self.config.hpge_num_features + 1) #NOTE: +1 hardcoded: no partition id
+        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
+        prefix_loss_count = [0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
-            (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _) = hpge
+            (_, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, _, ge_group_meta) = hpge
+
+            if ge_group_meta is None:
+                ge_group_ex_idx = None
+                ge_group_hpge_pos = None
+                ge_group_valid = None
+            else:
+                ge_group_ex_idx, ge_group_hpge_pos, ge_group_valid = ge_group_meta
 
             loss_, prefix_losses_ = self.forward_batch(
                 f_idx=ge_f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 f_vals=ge_f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 ge_max_seqlen=int(ge_max_seqlen),
+                ge_group_ex_idx=ge_group_ex_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long) if ge_group_ex_idx is not None else None,
+                ge_group_hpge_pos=ge_group_hpge_pos.to(device=self.device, non_blocking=True).to(dtype=torch.long) if ge_group_hpge_pos is not None else None,
+                ge_group_valid=ge_group_valid.to(device=self.device, non_blocking=True).to(dtype=torch.bool) if ge_group_valid is not None else None,
                 t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val,
@@ -348,7 +417,7 @@ class NRECTrainer(TrainerBase):
         if self.config.deep_supervision == 1:
             self.val_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
-                for t in range(self.config.hpge_num_features + 1)
+                for t in range(len(prefix_loss_sum))
             ])
 
 def train(

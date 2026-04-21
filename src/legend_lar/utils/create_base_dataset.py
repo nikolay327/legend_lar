@@ -9,13 +9,15 @@ from .db import FileDB
 from .configs import NRECConfig, _initialize_configs
 
 def create_base_dataset(
+    partition: str,
     file_db: FileDB,
-    data_config: dict
+    data_config: dict,
+    include_rc_from_ge_trigger: bool = True
 ):
     # bg training data
     geds_data_phy = file_db.build_file(
         tier="dataset",
-        partition="p16",
+        partition=partition,
         filename="geds_data_phy.lh5"
     )
 
@@ -23,7 +25,7 @@ def create_base_dataset(
     geds_data_phy = geds_data_phy[["id", "energy", "drift_time", "aoe", "lq"]].to_numpy().astype(np.float32)
     path = file_db.build_file(
         tier="training",
-        partition="p16",
+        partition=partition,
         version="base",
         filename="geds_data_phy.npy"
     )
@@ -33,14 +35,14 @@ def create_base_dataset(
 
     sipm_data_sparse_phy = file_db.build_file(
         tier="dataset",
-        partition="p16",
+        partition=partition,
         filename="sipm_data_sparse_phy.npz"
     )
     shutil.copy(
         sipm_data_sparse_phy,
         file_db.build_file(
             tier="training",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="sipm_data_sparse_phy.npz"
         )
@@ -48,17 +50,17 @@ def create_base_dataset(
 
     path = file_db.build_file(
         tier="dataset",
-        partition="p16",
+        partition=partition,
         filename="lib_phy.lh5"
     )
     phy_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
     mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
-    mask = (mask > 0) & (mask < 100)
+    mask = (mask > 0) & (mask < 500)
     phy_classical_classifier = phy_classical_classifier[mask]
     np.save(
         file_db.build_file(
             tier="training",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="classical_classifier_phy.npy"
         ), phy_classical_classifier
@@ -68,7 +70,7 @@ def create_base_dataset(
     rng = np.random.default_rng(seed=data_config["rng_seed_calib_selection"])
     sipm_data_sparse_fp = file_db.build_file(
         tier="dataset",
-        partition="p16",
+        partition=partition,
         filename="sipm_data_sparse_fp.npz"
     )
     sipm_data_sparse_fp = load_npz(sipm_data_sparse_fp)
@@ -79,12 +81,12 @@ def create_base_dataset(
 
     path = file_db.build_file(
         tier="dataset",
-        partition="p16",
+        partition=partition,
         filename="lib_rc_fp.lh5"
     )
     sipm_fp_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
     mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
-    mask = (mask > 0) & (mask < 100)
+    mask = (mask > 0) & (mask < 500)
     sipm_fp_classical_classifier = sipm_fp_classical_classifier[mask]
     
     # calibration
@@ -92,7 +94,7 @@ def create_base_dataset(
     sipm_data_sparse_calibration_classical_classifier = sipm_fp_classical_classifier[calibration_indices]
     path = file_db.build_file(
         tier="inference_dataset",
-        partition="p16",
+        partition=partition,
         version="base",
         filename="sipm_data_sparse_rc_ev_ep.npz"
     )
@@ -101,7 +103,7 @@ def create_base_dataset(
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="classical_classifier_rc_ev_ep.npy"
         ), sipm_data_sparse_calibration_classical_classifier[: data_config["num_calib_data"]]
@@ -109,7 +111,7 @@ def create_base_dataset(
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="indices_rc_ev_ep.npy"
         ), calibration_indices[: data_config["num_calib_data"]]
@@ -117,7 +119,7 @@ def create_base_dataset(
 
     path = file_db.build_file(
         tier="inference_dataset",
-        partition="p16",
+        partition=partition,
         version="base",
         filename="sipm_data_sparse_glob.npz"
     )
@@ -125,7 +127,7 @@ def create_base_dataset(
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="classical_classifier_glob.npy"
         ), sipm_data_sparse_calibration_classical_classifier[data_config["num_calib_data"]:]
@@ -133,7 +135,7 @@ def create_base_dataset(
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="indices_glob.npy"
         ), calibration_indices[data_config["num_calib_data"]:]
@@ -142,38 +144,46 @@ def create_base_dataset(
     # training
     sipm_data_sparse_fp = sipm_data_sparse_fp[training_indices]
     sipm_fp_classical_classifier = sipm_fp_classical_classifier[training_indices]
-    # include rc from ge trigger
-    sipm_data_sparse_ge = file_db.build_file(
-        tier="dataset",
-        partition="p16",
-        filename="sipm_data_sparse_ge.npz"
-    )
-    sipm_data_sparse_ge = load_npz(sipm_data_sparse_ge)
-    sipm_data_sparse_rc = sp.sparse.vstack([sipm_data_sparse_fp, sipm_data_sparse_ge], format="csr")
+
+    if include_rc_from_ge_trigger:
+        # include rc from ge trigger
+        sipm_data_sparse_ge = file_db.build_file(
+            tier="dataset",
+            partition=partition,
+            filename="sipm_data_sparse_ge.npz"
+        )
+        sipm_data_sparse_ge = load_npz(sipm_data_sparse_ge)
+        sipm_data_sparse_rc = sp.sparse.vstack([sipm_data_sparse_fp, sipm_data_sparse_ge], format="csr")
+    else:
+        sipm_data_sparse_rc = sipm_data_sparse_fp
 
     path = file_db.build_file(
         tier="training",
-        partition="p16",
+        partition=partition,
         version="base",
         filename="sipm_data_sparse_rc.npz"
     )
     sp.sparse.save_npz(path, sipm_data_sparse_rc)
 
-    path = file_db.build_file(
-        tier="dataset",
-        partition="p16",
-        filename="lib_rc_ge.lh5"
-    )
-    sipm_rc_ge_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
-    mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
-    mask = (mask > 0) & (mask < 100)
-    sipm_rc_ge_classical_classifier = sipm_rc_ge_classical_classifier[mask]
+    if include_rc_from_ge_trigger:
+        path = file_db.build_file(
+            tier="dataset",
+            partition=partition,
+            filename="lib_rc_ge.lh5"
+        )
+        sipm_rc_ge_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
+        mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
+        mask = (mask > 0) & (mask < 500)
+        sipm_rc_ge_classical_classifier = sipm_rc_ge_classical_classifier[mask]
 
-    sipm_rc_classical_classifier = np.concatenate([sipm_fp_classical_classifier, sipm_rc_ge_classical_classifier], axis=0)
+        sipm_rc_classical_classifier = np.concatenate([sipm_fp_classical_classifier, sipm_rc_ge_classical_classifier], axis=0)
+    else:
+        sipm_rc_classical_classifier = sipm_fp_classical_classifier
+
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="classical_classifier_rc.npy"
         ), sipm_rc_classical_classifier
@@ -181,7 +191,7 @@ def create_base_dataset(
     np.save(
         file_db.build_file(
             tier="inference_dataset",
-            partition="p16",
+            partition=partition,
             version="base",
             filename="indices_rc.npy"
         ), training_indices
@@ -223,6 +233,8 @@ if __name__ == "__main__":
     )
 
     create_base_dataset(
+        partition=args.partition,
         file_db=file_db,
-        data_config=data_config
+        data_config=data_config,
+        include_rc_from_ge_trigger=data_config["include_rc_from_ge_trigger"]
     )
