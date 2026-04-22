@@ -360,14 +360,15 @@ class CausalHPGeEncoder(nn.Module):
         else:
             self.partitioning_emb = None
 
-        self.features_tokenizer = ContinuousFourierTokenizer(
-            emb_dim=self.config.hidden_size,
-            mlp_hidden_dim=self.config.intermediate_size,
-            num_bands=self.config.hpge_num_feat_bands,
-            max_freq_log2=self.config.hpge_feat_max_freq_log2
-        )
-
-        self.features_id_emb = nn.Embedding(self.config.hpge_num_features, self.config.hidden_size)
+        self.features_tokenizers = nn.ModuleList([
+            ContinuousFourierTokenizer(
+                emb_dim=self.config.hidden_size,
+                mlp_hidden_dim=self.config.intermediate_size,
+                num_bands=self.config.hpge_num_feat_bands,
+                max_freq_log2=self.config.hpge_feat_max_freq_log2
+            )
+            for _ in range(self.config.hpge_num_features)
+        ])
 
         self.blocks = nn.ModuleList([
             create_block(self.config, True) for _ in range(self.config.hpge_num_layers)
@@ -381,6 +382,30 @@ class CausalHPGeEncoder(nn.Module):
             nn.Linear(self.config.intermediate_size, self.config.hidden_size)
         )
 
+    def _tokenize_continuous_features(
+        self,
+        feat_vals: Tensor,
+        feat_local_idx: Tensor,
+        device,
+        dtype
+    ) -> Tensor:
+        feat_emb = torch.empty(
+            (feat_vals.shape[0], self.config.hidden_size),
+            device=device,
+            dtype=dtype
+        )
+
+        for j, tokenizer in enumerate(self.features_tokenizers):
+            pos = (feat_local_idx == j).nonzero(as_tuple=True)[0]
+            if pos.numel() == 0:
+                continue
+
+            vals_j = feat_vals.index_select(0, pos)
+            emb_j = tokenizer(vals_j)
+            feat_emb.index_copy_(0, pos, emb_j)
+
+        return feat_emb
+
     def forward(
         self,
         f_idx: Tensor, # (N_valid,)
@@ -389,8 +414,8 @@ class CausalHPGeEncoder(nn.Module):
         max_seqlen: int,
         geom_tokenizer: GeometryTokenizer
     ) -> Tensor:
-        device = self.features_id_emb.weight.device
-        dtype = self.features_id_emb.weight.dtype
+        device = self.det_emb.weight.device
+        dtype = self.det_emb.weight.dtype
 
         gid_mask = f_idx == 0
         if self.config.subpartition_hpge_feats == 1:
@@ -412,9 +437,14 @@ class CausalHPGeEncoder(nn.Module):
         geom_tokens = geom_tokens + self.det_emb(gid)
 
         # feature tokens
-        feat_emb = (
-            self.features_tokenizer(f_vals[feat_mask])
-            + self.features_id_emb(f_idx[feat_mask] - feats_start)
+        feat_vals = f_vals[feat_mask]
+        feat_local_idx = f_idx[feat_mask] - feats_start
+
+        feat_emb = self._tokenize_continuous_features(
+            feat_vals=feat_vals,
+            feat_local_idx=feat_local_idx,
+            device=device,
+            dtype=dtype
         )
 
         tokens = torch.empty(
