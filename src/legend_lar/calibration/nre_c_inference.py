@@ -131,7 +131,7 @@ class NRECCalibrator:
             shuffle=False,
             num_workers=8,
             pin_memory=False,
-            prefetch_factor=2,
+            prefetch_factor=1,
             persistent_workers=True,
             worker_init_fn=worker_init_fn,
             collate_fn=collate_fn
@@ -178,7 +178,7 @@ class NRECCalibrator:
             shuffle=False,
             num_workers=8,
             pin_memory=False,
-            prefetch_factor=2,
+            prefetch_factor=1,
             persistent_workers=True,
             worker_init_fn=worker_init_fn,
             collate_fn=collate_fn
@@ -225,7 +225,7 @@ class NRECCalibrator:
             shuffle=False,
             num_workers=8,
             pin_memory=False,
-            prefetch_factor=2,
+            prefetch_factor=1,
             persistent_workers=True,
             worker_init_fn=worker_init_fn,
             collate_fn=collate_fn
@@ -283,34 +283,38 @@ class NRECCalibrator:
     def _select_hpge_embeddings(
         self,
         e_hpge: Tensor, # (N_packed, D)
-        ge_cu_seqlens: Tensor, # (B + 1,)
-        ge_lengths: Tensor # (B,)
+        ge_b_idx: Tensor, # (N_packed,)
+        ge_f_idx: Tensor, # (N_packed,)
+        ge_cu_seqlens: Tensor # (B + 1,)
     ):
-        starts = ge_cu_seqlens[:-1].to(torch.long)
-        ge_lengths = ge_lengths.to(torch.long)
+        selected_pos = ge_cu_seqlens[1:].to(torch.long) - 1 # (B,)
+        if self.max_t >= 0:
+            pos_t = (ge_f_idx == self.max_t).nonzero(as_tuple=True)[0]
+            if pos_t.numel() > 0:
+                ex_t = ge_b_idx.index_select(0, pos_t)
+                selected_pos[ex_t] = pos_t
 
-        if self.max_t < 0:
-            local_idx = ge_lengths - 1
-        else:
-            local_idx = torch.clamp(ge_lengths - 1, max=self.max_t)
+        selected_t = ge_f_idx.index_select(0, selected_pos)
+        selected_e = e_hpge.index_select(0, selected_pos) # (B, D)
 
-        return e_hpge.index_select(0, starts + local_idx), local_idx
+        return selected_e, selected_t
 
     def model_forward(self, model: NREC, lar, hpge):
         (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
-        t_idx=t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-        s_idx=s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-        v_val=v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val
-        cu_seqlens=cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-        max_seqlen=int(max_seqlen)
+        t_idx = t_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        s_idx = s_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        v_val = v_val.to(device=self.device, non_blocking=True).to(dtype=torch.float32) if v_val is not None else v_val
+        cu_seqlens = cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        max_seqlen = int(max_seqlen)
 
-        (_, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths) = hpge
-        if f_idx is not None:            
-            f_idx=f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            f_vals=f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
-            ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+        (ge_b_idx, f_idx, f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths, _) = hpge
+        if f_idx is not None:
+            ge_b_idx = ge_b_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            f_idx = f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long)
+            f_vals = f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32)
+            ge_cu_seqlens = ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long)
             ge_lengths = ge_lengths.to(device=self.device, non_blocking=True).to(dtype=torch.long)
-            ge_max_seqlen=int(ge_max_seqlen)
+            ge_max_seqlen = int(ge_max_seqlen)
 
         e_lar, e_hpge = model(
             t_idx=t_idx,
@@ -323,15 +327,23 @@ class NRECCalibrator:
             ge_cu_seqlens=ge_cu_seqlens,
             ge_max_seqlen=ge_max_seqlen
         )
-        e_lar = F.normalize(e_lar, p=2, dim=-1) # (B, D)
+
+        e_lar = F.normalize(e_lar, p=2, dim=-1)
 
         if e_hpge is None:
             selected_t = None
         else:
             if self.config.deep_supervision == 1:
-                e_hpge, selected_t = self._select_hpge_embeddings(e_hpge, ge_cu_seqlens, ge_lengths)
+                e_hpge, selected_t = self._select_hpge_embeddings(
+                    e_hpge=e_hpge,
+                    ge_b_idx=ge_b_idx,
+                    ge_f_idx=f_idx,
+                    ge_cu_seqlens=ge_cu_seqlens
+                )
             else:
-                selected_t = ge_lengths - 1
+                # For non-deep-supervision, log the rightmost available raw feature id
+                last_pos = ge_cu_seqlens[1:].to(torch.long) - 1
+                selected_t = f_idx.index_select(0, last_pos)
 
             e_hpge = F.normalize(e_hpge, p=2, dim=-1)
 
@@ -511,7 +523,7 @@ class NRECCalibrator:
                 glob_null_p_val_glob = torch.cat(glob_null_p_val_glob, dim=-1) # (B, N_glob_null)
 
             # retrieve HPGe observables
-            (b_idx, f_idx, f_vals, _, _, geds_lengths) = hpge
+            (b_idx, f_idx, f_vals, _, _, geds_lengths, _) = hpge
             # NOTE: this part is hardcoded based on the data ordering from utils/create_base_dataset.py
             geds_features = self.unpack_hpge_nrec_data(b_idx, f_idx, f_vals, geds_lengths) # (B, H)
             geds_features = geds_features.cpu().numpy().astype(np.float32)
@@ -575,7 +587,7 @@ class NRECCalibrator:
                 lgdo_table = Table(
                     size=table_size,
                     col_dict={
-                        "evt_idx": Array(np.asarry(indices).astype(np.float32)),
+                        "evt_idx": Array(np.asarray(indices).astype(np.float32)),
                         "t_used": Array(selected_t.cpu().numpy().astype(np.float32), dtype=np.float32),
                         "g_id": Array(gid, dtype=np.float32),
                         "energy": Array(energy, dtype=np.float32),
@@ -642,7 +654,8 @@ def main(
     train_dataset_version: str,
     dataflow_dir: str,
     batch_size: int,
-    cache_dir: str
+    cache_dir: str,
+    max_t: int = -1
 ):
     _, _, device = _init_torch(cache_dir)
 
@@ -658,7 +671,8 @@ def main(
         version=version,
         dataset_version=train_dataset_version,
         batch_size=batch_size,
-        device=device
+        device=device,
+        max_t=max_t
     )
 
     calibrator.infer()
@@ -674,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
     parser.add_argument("batch_size", type=int, help="Batch size")
     parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
+    parser.add_argument("--max_t", type=int, default=-1, help="Raw HPGe prefix to use at inference. -1 means rightmost available raw prefix")
     args = parser.parse_args()
 
     main(
@@ -684,5 +699,6 @@ if __name__ == "__main__":
         args.train_dataset_version,
         args.dataflow_dir,
         args.batch_size,
-        args.cache_dir
+        args.cache_dir,
+        args.max_t
     )
