@@ -139,6 +139,13 @@ class UnbinnedLArEncoder(nn.Module):
             max_freq_log2=self.config.sipm_feat_max_freq_log2
         )
 
+        self.norm_in = nn.LayerNorm(self.config.hidden_size)
+        self.proj_in = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.intermediate_size),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.config.intermediate_size, self.config.hidden_size)
+        )
+
         self.cls_token = nn.Parameter(torch.empty(self.config.hidden_size))
 
         self.blocks = nn.ModuleList([
@@ -199,6 +206,7 @@ class UnbinnedLArEncoder(nn.Module):
         new_tokens.index_copy_(0, non_cls_pos, tokens)
 
         new_tokens = new_tokens.contiguous()
+        new_tokens = self.proj_in(self.norm_in(new_tokens))
 
         residual = None
         for block in self.blocks:
@@ -370,6 +378,13 @@ class CausalHPGeEncoder(nn.Module):
             for _ in range(self.config.hpge_num_features)
         ])
 
+        self.norm_in = nn.LayerNorm(self.config.hidden_size)
+        self.proj_in = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.intermediate_size),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.config.intermediate_size, self.config.hidden_size)
+        )
+
         self.blocks = nn.ModuleList([
             create_block(self.config, True) for _ in range(self.config.hpge_num_layers)
         ])
@@ -468,6 +483,7 @@ class CausalHPGeEncoder(nn.Module):
         tokens.index_copy_(0, feat_pos, feat_emb)
 
         tokens = tokens.contiguous()
+        tokens = self.proj_in(self.norm_in(tokens))
 
         residual = None
         for block in self.blocks:
