@@ -22,6 +22,7 @@ from legend_lar.utils import FileDB, NRECConfig, _initialize_configs, _init_torc
 
 from legend_lar.kfold_ensemble.base import TrainerBase
 
+
 class NRECTrainer(TrainerBase):
     def __init__(
         self,
@@ -55,6 +56,9 @@ class NRECTrainer(TrainerBase):
 
         self.lar_detector_coords = lar_detector_coords
         self.hpge_detector_coords = hpge_detector_coords
+        self.num_hpge_prefixes = self.config.hpge_num_features + (
+            3 if self.config.subpartition_hpge_feats == 1 else 2
+        )
 
         self.train_prefix_losses = []
         self.val_prefix_losses = []
@@ -71,10 +75,10 @@ class NRECTrainer(TrainerBase):
             self.get_model_reinit_seed(fid, bid)
         )
 
-    def _init_optimizer(self, model_opt_state = None):
+    def _init_optimizer(self, model_opt_state=None):
         self.model_opt = FusedMixedPrecisionLamb(
             params=self.model.parameters(),
-            lr = self.config.lr_model,
+            lr=self.config.lr_model,
             betas=self.config.betas_model,
             weight_decay=self.config.weight_decay
         )
@@ -110,7 +114,9 @@ class NRECTrainer(TrainerBase):
         cp = torch.load(save_path, map_location=self.device)
         epoch = cp["epoch"]
         if epoch != last_epoch:
-            raise ValueError(f'Variable last_epoch with value ({last_epoch}) is different from the last saved checkpoint ({epoch})')
+            raise ValueError(
+                f'Variable last_epoch with value ({last_epoch}) is different from the last saved checkpoint ({epoch})'
+            )
         else:
             self.last_saved_epoch = last_epoch
 
@@ -134,7 +140,7 @@ class NRECTrainer(TrainerBase):
                 logits + (0.0 if self.config.gamma == 1 else math.log(self.config.gamma))
             ],
             dim=-1
-        ) # (G, 2K, K+1)
+        )  # (G, 2K, K+1)
 
         loss_y0 = F.cross_entropy(
             logits[:, :K].reshape(G * K, K + 1),
@@ -150,6 +156,7 @@ class NRECTrainer(TrainerBase):
             1.0 / (1.0 + self.config.gamma) * loss_y0
             + self.config.gamma / (1.0 + self.config.gamma) * loss_y_not0
         )
+
     def calculate_deep_supervision_loss(
         self,
         e_lar: Tensor, # (2 * B_hpge, D)
@@ -172,18 +179,16 @@ class NRECTrainer(TrainerBase):
             self.config.alpha_t[:Tprefix],
             device=e_lar.device,
             dtype=e_lar.dtype
-        )  # (Tprefix,)
+        )
 
         active_prefix = ge_group_valid.any(dim=1) & (alpha_t > 0)
         if not active_prefix.any():
             raise RuntimeError("No valid deep-supervision prefix groups were found in this batch.")
 
-        # Gather into fixed shapes
         hpge_all = e_hpge[ge_group_hpge_pos] # (Tprefix, Gmax, K, D)
         lar_y0_all = e_lar[ge_group_ex_idx] # (Tprefix, Gmax, K, D)
         lar_y1_all = e_lar[ge_group_ex_idx + B_hpge] # (Tprefix, Gmax, K, D)
 
-        # Flatten prefix and group dims for big batched matmuls
         TG = Tprefix * Gmax
         hpge_all = hpge_all.view(TG, K, D)
         lar_y0_all = lar_y0_all.view(TG, K, D)
@@ -196,8 +201,8 @@ class NRECTrainer(TrainerBase):
         loggamma = 0.0 if self.config.gamma == 1 else math.log(self.config.gamma)
 
         null_col = torch.full((TG, K, 1), logK, device=e_lar.device, dtype=e_lar.dtype)
-        logits_y0 = torch.cat([null_col, logits_y0 + loggamma], dim=-1) # (TG, K, K+1)
-        logits_y1 = torch.cat([null_col, logits_y1 + loggamma], dim=-1) # (TG, K, K+1)
+        logits_y0 = torch.cat([null_col, logits_y0 + loggamma], dim=-1)  # (TG, K, K+1)
+        logits_y1 = torch.cat([null_col, logits_y1 + loggamma], dim=-1)  # (TG, K, K+1)
 
         target_y0 = torch.zeros(TG * K, dtype=torch.long, device=e_lar.device)
         target_y1 = torch.arange(K, device=e_lar.device).unsqueeze(0).expand(TG, K).reshape(TG * K) + 1
@@ -214,13 +219,13 @@ class NRECTrainer(TrainerBase):
             reduction="none"
         ).view(Tprefix, Gmax, K)
 
-        valid_f = ge_group_valid.to(e_lar.dtype) # (Tprefix, Gmax)
-        valid_rows = valid_f.unsqueeze(-1) # (Tprefix, Gmax, 1)
+        valid_f = ge_group_valid.to(e_lar.dtype)
+        valid_rows = valid_f.unsqueeze(-1)
 
         coeff_y0 = 1.0 / (1.0 + self.config.gamma)
         coeff_y1 = self.config.gamma / (1.0 + self.config.gamma)
 
-        row_count = ge_group_valid.sum(dim=1).to(e_lar.dtype) * K # (Tprefix,)
+        row_count = ge_group_valid.sum(dim=1).to(e_lar.dtype) * K
 
         prefix_losses_t = torch.full(
             (Tprefix,),
@@ -229,8 +234,8 @@ class NRECTrainer(TrainerBase):
             dtype=e_lar.dtype
         )
 
-        sum_y0 = (loss_y0_rows * valid_rows).sum(dim=(1, 2)) # (Tprefix,)
-        sum_y1 = (loss_y1_rows * valid_rows).sum(dim=(1, 2)) # (Tprefix,)
+        sum_y0 = (loss_y0_rows * valid_rows).sum(dim=(1, 2))
+        sum_y1 = (loss_y1_rows * valid_rows).sum(dim=(1, 2))
 
         prefix_losses_t[active_prefix] = (
             coeff_y0 * (sum_y0[active_prefix] / row_count[active_prefix])
@@ -303,23 +308,19 @@ class NRECTrainer(TrainerBase):
             ge_group_valid=ge_group_valid
         )
 
-    def train_batch(
-        self, *args, **kwargs
-    ):
-
+    def train_batch(self, *args, **kwargs):
         loss, prefix_losses = self.forward_batch(*args, **kwargs)
         self.model_opt.zero_grad()
         loss.backward()
         self.model_opt.step()
-
         return loss.detach().item(), prefix_losses
 
     def train_epoch(self):
         loss = 0.
         n_step = 0
 
-        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
-        prefix_loss_count = [0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
+        prefix_loss_sum = [0.0] * self.num_hpge_prefixes
+        prefix_loss_count = [0] * self.num_hpge_prefixes
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
@@ -362,7 +363,7 @@ class NRECTrainer(TrainerBase):
         if self.config.deep_supervision == 1:
             self.train_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
-                for t in range(len(prefix_loss_sum))
+                for t in range(self.num_hpge_prefixes)
             ])
 
     def val_batch(self):
@@ -373,8 +374,8 @@ class NRECTrainer(TrainerBase):
         loss = 0.
         n_step = 0
 
-        prefix_loss_sum = [0.0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
-        prefix_loss_count = [0] * (self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1))
+        prefix_loss_sum = [0.0] * self.num_hpge_prefixes
+        prefix_loss_count = [0] * self.num_hpge_prefixes
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
@@ -417,8 +418,9 @@ class NRECTrainer(TrainerBase):
         if self.config.deep_supervision == 1:
             self.val_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
-                for t in range(len(prefix_loss_sum))
+                for t in range(self.num_hpge_prefixes)
             ])
+
 
 def train(
     experiment: str,
@@ -462,7 +464,6 @@ def train(
         version=train_dataset_version,
         filename=data_config["hpge_dataset"]
     )
-    # load into RAM
     hpge_dataset = open_memmap(
         filename=hpge_dataset,
         mode="r"
@@ -470,15 +471,14 @@ def train(
 
     lar_datasets = [
         file_db.build_file(
-        tier="training",
-        partition=partition,
-        version=train_dataset_version,
-        filename=data_config["lar_datasets"][i]
-    ) for i in range(2)
+            tier="training",
+            partition=partition,
+            version=train_dataset_version,
+            filename=data_config["lar_datasets"][i]
+        ) for i in range(2)
     ]
     lar_datasets = [scipy.sparse.load_npz(path) for path in lar_datasets]
 
-    # decode detector positions
     det_geom_and_subpart = file_db.build_file(
         tier="dataset",
         partition=partition,
@@ -529,6 +529,7 @@ def train(
         to_be_trained = to_be_trained[shard_size * rank: shard_size * (rank + 1)]
 
     trainer.train(to_be_trained)
+
 
 if __name__ == "__main__":
     import argparse

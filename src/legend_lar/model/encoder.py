@@ -378,6 +378,8 @@ class CausalHPGeEncoder(nn.Module):
             for _ in range(self.config.hpge_num_features)
         ])
 
+        self.sos_token = nn.Parameter(torch.empty(self.config.hidden_size))
+
         self.norm_in = nn.LayerNorm(self.config.hidden_size)
         self.proj_in = nn.Sequential(
             nn.Linear(self.config.hidden_size, self.config.intermediate_size),
@@ -432,26 +434,25 @@ class CausalHPGeEncoder(nn.Module):
         device = self.det_emb.weight.device
         dtype = self.det_emb.weight.dtype
 
+        cls_mask = f_idx == self.config.cls_placeholder_id
         gid_mask = f_idx == 0
+
         if self.config.subpartition_hpge_feats == 1:
             pid_mask = f_idx == 1
-            feat_mask = ~(gid_mask | pid_mask)
+            feat_mask = ~(cls_mask | gid_mask | pid_mask)
             feats_start = 2
 
             partitioning_emb = self.partitioning_emb(f_vals[pid_mask].to(torch.long))
         else:
-            feat_mask = ~gid_mask
+            feat_mask = ~(cls_mask | gid_mask)
             feats_start = 1
             partitioning_emb = None
 
-        # detector hit tokenizer
         gid = f_vals[gid_mask].to(torch.long)
         r_tokens, phi_tokens, z_tokens = self.geometry_table(gid)
         geom_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
-        # residual detectorwise-information
         geom_tokens = geom_tokens + self.det_emb(gid)
 
-        # feature tokens
         feat_vals = f_vals[feat_mask]
         feat_local_idx = f_idx[feat_mask] - feats_start
 
@@ -469,16 +470,17 @@ class CausalHPGeEncoder(nn.Module):
             dtype=dtype
         )
 
-        # gid token
+        sos_pos = cu_seqlens[:-1].to(torch.long)
+        sos_src = self.sos_token.unsqueeze(0).expand(sos_pos.numel(), -1)
+        tokens.index_copy_(0, sos_pos, sos_src)
+
         gid_pos = gid_mask.nonzero(as_tuple=False).squeeze(-1)
         tokens.index_copy_(0, gid_pos, geom_tokens)
 
-        # partitioning tokens
         if self.config.subpartition_hpge_feats == 1:
             pid_pos = pid_mask.nonzero(as_tuple=False).squeeze(-1)
             tokens.index_copy_(0, pid_pos, partitioning_emb)
 
-        # feature tokens
         feat_pos = feat_mask.nonzero(as_tuple=False).squeeze(-1)
         tokens.index_copy_(0, feat_pos, feat_emb)
 
@@ -498,7 +500,7 @@ class CausalHPGeEncoder(nn.Module):
         tokens = self.proj_out(tokens)
 
         if self.config.deep_supervision == 0:
-            last_pos = cu_seqlens[1:].to(torch.long) - 1 # (B,)
-            tokens = tokens.index_select(0, last_pos) # (B, D)
+            last_pos = cu_seqlens[1:].to(torch.long) - 1
+            tokens = tokens.index_select(0, last_pos)
 
         return tokens

@@ -41,9 +41,6 @@ class NRECCollateFn:
         if ge_b_idx is None or ge_f_idx is None or ge_cu_seqlens is None:
             return None
 
-        if self.has_cls:
-            return None
-
         if self.cnre_group_size is None or self.hpge_prefix_count is None:
             return None
 
@@ -64,7 +61,14 @@ class NRECCollateFn:
             return group_ex_idx, group_hpge_pos, group_valid
 
         for t in range(Tprefix):
-            pos = (ge_f_idx == t).nonzero(as_tuple=True)[0]
+            if self.has_cls:
+                if t == 0:
+                    pos = ge_cu_seqlens[:-1].to(torch.long)
+                else:
+                    pos = (ge_f_idx == (t - 1)).nonzero(as_tuple=True)[0]
+            else:
+                pos = (ge_f_idx == t).nonzero(as_tuple=True)[0]
+
             n_valid = (pos.numel() // K) * K
             if n_valid == 0:
                 continue

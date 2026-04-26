@@ -101,10 +101,10 @@ class TrainerBase(ABC):
         )
         self.collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
-            has_cls=self.config.deep_supervision != 1,
+            has_cls=True,#self.config.deep_supervision != 1,
             sipm_unbinned_pe=self.config.sipm_unbinned_pe == 1,
             cnre_group_size=self.config.K,
-            hpge_prefix_count=self.config.hpge_num_features + (2 if self.config.subpartition_hpge_feats == 1 else 1),
+            hpge_prefix_count=self.config.hpge_num_features + (3 if self.config.subpartition_hpge_feats == 1 else 2),
             cuda_device=self.device
         )
         worker_init_fn = partial(
@@ -116,7 +116,7 @@ class TrainerBase(ABC):
             dataset=self.dataset,
             batch_size=None,
             shuffle=False,
-            num_workers=16,
+            num_workers=8,
             pin_memory=False,
             prefetch_factor=1,
             persistent_workers=True,
