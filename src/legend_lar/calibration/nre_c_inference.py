@@ -275,7 +275,7 @@ class NRECCalibrator:
             cp = torch.load(cp, weights_only=True, map_location=self.device)["model"]
             cp = self.clean_state_dict(cp)
             model.load_state_dict(cp, strict=True)
-            model = torch.compile(model, dynamic=True)
+            # model = torch.compile(model, dynamic=True)
             self.ensemble.append(model)
         
         self.ensemble.eval()
