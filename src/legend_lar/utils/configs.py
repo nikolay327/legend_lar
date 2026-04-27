@@ -20,6 +20,7 @@ class NRECConfig:
     temperature: float = None
     deep_supervision: int = None
     alpha_t: list[float] = None
+    lambda_aux: list[float] = None
 
     # Transformer general config
     hidden_size: int = None

@@ -106,6 +106,7 @@ class NRECPrefixScanEngine:
         self._n_raw_hpge_feats = self.config.hpge_num_features + (
             2 if self.config.subpartition_hpge_feats == 1 else 1
         )
+        self._n_hpge_prefixes = self._n_raw_hpge_feats + 1
 
         lar_detector_coords, hpge_detector_coords = decode_geom(
             self.file_db.build_file(
@@ -141,17 +142,11 @@ class NRECPrefixScanEngine:
         self.set_fold_id(fold_id, selected_bids=selected_bids)
 
     def _init_rc_dataloader(self):
-        # lar_dataset = self.file_db.build_file(
-        #     tier="inference_dataset",
-        #     partition=self.partition,
-        #     version=self.dataset_version,
-        #     filename=self.data_config["ev_ep_null"]
-        # )
         lar_dataset = self.file_db.build_file(
-            tier="dataset",
+            tier="inference_dataset",
             partition=self.partition,
             version=self.dataset_version,
-            filename="sipm_data_sparse_fp_test.npz"
+            filename=self.data_config["ev_ep_null"]
         )
         lar_dataset = scipy.sparse.load_npz(lar_dataset)
 
@@ -166,7 +161,7 @@ class NRECPrefixScanEngine:
 
         collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
-            has_cls=False, # deep supervision path
+            has_cls=True,
             sipm_unbinned_pe=self.config.sipm_unbinned_pe == 1,
             cuda_device=self.device
         )
@@ -269,11 +264,6 @@ class NRECPrefixScanEngine:
 
     @torch.no_grad()
     def _encode_all_prefix_hpge_bank_for_model(self, model: NREC) -> tuple[Tensor, Tensor]:
-        """
-        Returns:
-            bank: (N_grid, P, D)
-            valid_mask: (N_grid, P)
-        """
         if self._scan_pack is None:
             raise RuntimeError("No scan specification has been set.")
 
@@ -292,17 +282,25 @@ class NRECPrefixScanEngine:
             max_seqlen=ge_max_seqlen,
             geom_tokenizer=model.geom_tokenizer
         )
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1) # (N_packed, D)
+        e_hpge = F.normalize(e_hpge, p=2, dim=-1)
 
         n_grid = int(ge_cu_seqlens.numel() - 1)
         D = e_hpge.shape[-1]
-        P = self._n_raw_hpge_feats
+        P = self._n_hpge_prefixes
 
         bank = torch.zeros((n_grid, P, D), device=self.device, dtype=e_hpge.dtype)
         valid_mask = torch.zeros((n_grid, P), device=self.device, dtype=torch.bool)
 
-        bank[ge_b_idx, f_idx] = e_hpge
-        valid_mask[ge_b_idx, f_idx] = True
+        cls_mask = f_idx == self.config.cls_placeholder_id
+        non_cls_mask = ~cls_mask
+
+        # prefix 0 = SOS
+        bank[ge_b_idx[cls_mask], 0] = e_hpge[cls_mask]
+        valid_mask[ge_b_idx[cls_mask], 0] = True
+
+        # prefix p>0 corresponds to raw feature id (p-1)
+        bank[ge_b_idx[non_cls_mask], f_idx[non_cls_mask] + 1] = e_hpge[non_cls_mask]
+        valid_mask[ge_b_idx[non_cls_mask], f_idx[non_cls_mask] + 1] = True
 
         return bank, valid_mask
 
@@ -407,7 +405,7 @@ class NRECPrefixScanEngine:
         ge_b_idx, ge_f_idx, ge_f_vals, ge_cu_seqlens, ge_max_seqlen, ge_lengths = pack_hpge_nrec_data(
             x_grid,
             cls_placeholder_id=self.config.cls_placeholder_id,
-            has_cls=False
+            has_cls=True
         )
 
         self._scan_feature_idx = scan_feature_idx
@@ -502,7 +500,7 @@ class NRECPrefixScanEngine:
         of shape (n_selected_bids, N_grid, N_rc).
         """
         prefix_idx = int(prefix_idx)
-        if prefix_idx < 0 or prefix_idx >= self._n_raw_hpge_feats:
+        if prefix_idx < 0 or prefix_idx >= self._n_hpge_prefixes:
             raise ValueError(f"Invalid prefix_idx={prefix_idx}.")
 
         mode = str(mode).lower()
@@ -552,3 +550,7 @@ class NRECPrefixScanEngine:
     @property
     def scan_valid_mask(self) -> Tensor | None:
         return self._scan_valid_mask
+    
+    @property
+    def num_hpge_prefixes(self) -> int:
+        return self._n_hpge_prefixes

@@ -24,6 +24,19 @@ from legend_lar.kfold_ensemble.base import TrainerBase
 
 
 class NRECTrainer(TrainerBase):
+    def _init_loss_store(self):
+        self.train_loss = []
+        self.val_loss = []
+
+        self.train_prefix_losses = []
+        self.val_prefix_losses = []
+
+        self.train_aux_loss = []
+        self.val_aux_loss = []
+
+        self.train_aux_prefix_losses = []
+        self.val_aux_prefix_losses = []
+
     def __init__(
         self,
         file_db: FileDB,
@@ -60,8 +73,14 @@ class NRECTrainer(TrainerBase):
             3 if self.config.subpartition_hpge_feats == 1 else 2
         )
 
-        self.train_prefix_losses = []
-        self.val_prefix_losses = []
+        lambda_aux = getattr(self.config, "lambda_aux", [1.0, 0.0])
+        if len(lambda_aux) != 2:
+            raise ValueError("config.lambda_aux must be a list of length 2.")
+        self.lambda_main = float(lambda_aux[0])
+        self.lambda_interaction = float(lambda_aux[1])
+
+        if self.lambda_main == 0.0 and self.lambda_interaction == 0.0:
+            raise ValueError("Both entries of config.lambda_aux are zero.")
 
     def _reinit_model(self, fid: int, bid: int):
         self.model = NREC(
@@ -84,6 +103,39 @@ class NRECTrainer(TrainerBase):
         )
         if model_opt_state is not None:
             self.model_opt.load_state_dict(model_opt_state)
+
+    def save_checkpoint(self, fid: int, bid: int, epoch: int):
+        save_path = self.file_db.build_file(
+            tier="models",
+            partition=self.partition,
+            model_name=self.model_name,
+            version=self.version,
+            fid=fid,
+            bid=bid
+        )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if os.path.isfile(save_path):
+            os.remove(save_path)
+
+        torch.save({
+            "fid": fid,
+            "bid": bid,
+            "epoch": epoch,
+            "model": self.model.module.state_dict() if hasattr(self.model, "module") else self.model.state_dict(),
+            "model_opt": self.model_opt.state_dict(),
+
+            "train_loss": self.train_loss,
+            "val_loss": self.val_loss,
+            "train_prefix_losses": self.train_prefix_losses,
+            "val_prefix_losses": self.val_prefix_losses,
+
+            "train_aux_loss": self.train_aux_loss,
+            "val_aux_loss": self.val_aux_loss,
+            "train_aux_prefix_losses": self.train_aux_prefix_losses,
+            "val_aux_prefix_losses": self.val_aux_prefix_losses,
+
+            "best_val_loss": self.best_val_loss
+        }, save_path)
 
     def reset_model_and_optimizer(self, fid: int, bid: int, start_from_epoch: int = 1):
         self._reinit_model(fid, bid)
@@ -129,6 +181,12 @@ class NRECTrainer(TrainerBase):
         self.val_loss = cp["val_loss"]
         self.train_prefix_losses = cp.get("train_prefix_losses", [])
         self.val_prefix_losses = cp.get("val_prefix_losses", [])
+
+        self.train_aux_loss = cp.get("train_aux_loss", [])
+        self.val_aux_loss = cp.get("val_aux_loss", [])
+        self.train_aux_prefix_losses = cp.get("train_aux_prefix_losses", [])
+        self.val_aux_prefix_losses = cp.get("val_aux_prefix_losses", [])
+
         self.best_val_loss = cp.get("best_val_loss", cp["val_loss"][-1])
 
     def calculate_loss(self, logits: Tensor, K: int):
@@ -157,13 +215,13 @@ class NRECTrainer(TrainerBase):
             + self.config.gamma / (1.0 + self.config.gamma) * loss_y_not0
         )
 
-    def calculate_deep_supervision_loss(
+    def calculate_main_deep_supervision_loss(
         self,
-        e_lar: Tensor, # (2 * B_hpge, D)
-        e_hpge: Tensor, # (N_packed, D)
-        ge_group_ex_idx: Tensor, # (Tprefix, Gmax, K)
-        ge_group_hpge_pos: Tensor, # (Tprefix, Gmax, K)
-        ge_group_valid: Tensor # (Tprefix, Gmax)
+        e_lar: Tensor,
+        e_hpge: Tensor,
+        ge_group_ex_idx: Tensor,
+        ge_group_hpge_pos: Tensor,
+        ge_group_valid: Tensor
     ):
         K = self.config.K
         B_hpge = e_lar.shape[0] // 2
@@ -183,7 +241,7 @@ class NRECTrainer(TrainerBase):
 
         active_prefix = ge_group_valid.any(dim=1) & (alpha_t > 0)
         if not active_prefix.any():
-            raise RuntimeError("No valid deep-supervision prefix groups were found in this batch.")
+            raise RuntimeError("No valid main deep-supervision prefix groups were found in this batch.")
 
         hpge_all = e_hpge[ge_group_hpge_pos] # (Tprefix, Gmax, K, D)
         lar_y0_all = e_lar[ge_group_ex_idx] # (Tprefix, Gmax, K, D)
@@ -201,8 +259,8 @@ class NRECTrainer(TrainerBase):
         loggamma = 0.0 if self.config.gamma == 1 else math.log(self.config.gamma)
 
         null_col = torch.full((TG, K, 1), logK, device=e_lar.device, dtype=e_lar.dtype)
-        logits_y0 = torch.cat([null_col, logits_y0 + loggamma], dim=-1)  # (TG, K, K+1)
-        logits_y1 = torch.cat([null_col, logits_y1 + loggamma], dim=-1)  # (TG, K, K+1)
+        logits_y0 = torch.cat([null_col, logits_y0 + loggamma], dim=-1)
+        logits_y1 = torch.cat([null_col, logits_y1 + loggamma], dim=-1)
 
         target_y0 = torch.zeros(TG * K, dtype=torch.long, device=e_lar.device)
         target_y1 = torch.arange(K, device=e_lar.device).unsqueeze(0).expand(TG, K).reshape(TG * K) + 1
@@ -249,6 +307,88 @@ class NRECTrainer(TrainerBase):
         prefix_losses = prefix_losses_t.detach().cpu().tolist()
         return total_loss, prefix_losses
 
+    def calculate_interaction_aux_loss(
+        self,
+        e_lar: Tensor,
+        e_hpge: Tensor,
+        ge_group_ex_idx: Tensor,
+        ge_group_hpge_pos: Tensor,
+        ge_group_valid: Tensor
+    ):
+        K = self.config.K
+        B_hpge = e_lar.shape[0] // 2
+        Tprefix, _, _ = ge_group_ex_idx.shape
+
+        ge_group_ex_idx = ge_group_ex_idx.to(torch.long)
+        ge_group_hpge_pos = ge_group_hpge_pos.to(torch.long)
+        ge_group_valid = ge_group_valid.to(torch.bool)
+
+        prefix_losses_t = torch.full(
+            (Tprefix,),
+            float("nan"),
+            device=e_lar.device,
+            dtype=e_lar.dtype
+        )
+
+        valid0 = ge_group_valid[0]
+        if not valid0.any():
+            raise RuntimeError("Prefix-0 groups are missing, cannot build interaction loss.")
+
+        prefix0_pos_by_ex = torch.full(
+            (B_hpge,),
+            -1,
+            device=e_lar.device,
+            dtype=torch.long
+        )
+        prefix0_ex = ge_group_ex_idx[0, valid0].reshape(-1)
+        prefix0_pos = ge_group_hpge_pos[0, valid0].reshape(-1)
+        prefix0_pos_by_ex[prefix0_ex] = prefix0_pos
+
+        active_aux = torch.zeros((Tprefix,), device=e_lar.device, dtype=torch.bool)
+
+        for t in range(1, Tprefix):
+            valid_g = ge_group_valid[t].nonzero(as_tuple=True)[0]
+            G_t = valid_g.numel()
+
+            if G_t < 2:
+                continue
+
+            ex_idx = ge_group_ex_idx[t, valid_g] # (G_t, K)
+            hpge_pos_t = ge_group_hpge_pos[t, valid_g] # (G_t, K)
+
+            prefix0_pos_t = prefix0_pos_by_ex[ex_idx]
+            if (prefix0_pos_t < 0).any():
+                continue
+
+            hpge_t = e_hpge[hpge_pos_t] # (G_t, K, D)
+            hpge_0 = e_hpge[prefix0_pos_t] # (G_t, K, D)
+
+            lar_dep = e_lar[ex_idx + B_hpge] # (G_t, K, D)
+
+            logits_t_y1 = torch.bmm(lar_dep, hpge_t.transpose(1, 2)) / self.config.temperature
+            logits_0_y1 = (lar_dep * hpge_0).sum(dim=-1, keepdim=True) / self.config.temperature
+            logits_int_y1 = logits_t_y1 - logits_0_y1
+
+            ex_idx_ind = ex_idx.roll(shifts=-1, dims=0)
+            prefix0_pos_ind = prefix0_pos_by_ex[ex_idx_ind]
+            lar_ind = e_lar[ex_idx_ind + B_hpge]
+            hpge_0_ind = e_hpge[prefix0_pos_ind]
+
+            logits_t_y0 = torch.bmm(lar_ind, hpge_t.transpose(1, 2)) / self.config.temperature
+            logits_0_y0 = (lar_ind * hpge_0_ind).sum(dim=-1, keepdim=True) / self.config.temperature
+            logits_int_y0 = logits_t_y0 - logits_0_y0
+
+            logits_int = torch.cat([logits_int_y0, logits_int_y1], dim=1)  # (G_t, 2K, K)
+            prefix_losses_t[t] = self.calculate_loss(logits_int, K)
+            active_aux[t] = True
+
+        if not active_aux.any():
+            raise RuntimeError("No valid interaction-loss prefix groups were found in this batch.")
+
+        total_loss = prefix_losses_t[active_aux].mean()
+        prefix_losses = prefix_losses_t.detach().cpu().tolist()
+        return total_loss, prefix_losses
+
     def forward_batch(
         self,
         f_idx: Tensor,
@@ -281,6 +421,9 @@ class NRECTrainer(TrainerBase):
 
         K = self.config.K
         if self.config.deep_supervision == 0:
+            if self.lambda_interaction > 0.0:
+                raise RuntimeError("Auxiliary interaction loss requires deep_supervision == 1.")
+
             G = (len(ge_cu_seqlens) - 1) // K
             D = e_lar.shape[-1]
 
@@ -298,29 +441,66 @@ class NRECTrainer(TrainerBase):
                 dim=1
             ) / self.config.temperature
 
-            return self.calculate_loss(logits, K), None
+            total_loss = self.calculate_loss(logits, K)
+            return total_loss, None, math.nan, None
 
-        return self.calculate_deep_supervision_loss(
-            e_lar=e_lar,
-            e_hpge=e_hpge,
-            ge_group_ex_idx=ge_group_ex_idx,
-            ge_group_hpge_pos=ge_group_hpge_pos,
-            ge_group_valid=ge_group_valid
-        )
+        main_loss = None
+        main_prefix_losses = [math.nan] * self.num_hpge_prefixes
+        if self.lambda_main > 0.0:
+            main_loss, main_prefix_losses = self.calculate_main_deep_supervision_loss(
+                e_lar=e_lar,
+                e_hpge=e_hpge,
+                ge_group_ex_idx=ge_group_ex_idx,
+                ge_group_hpge_pos=ge_group_hpge_pos,
+                ge_group_valid=ge_group_valid
+            )
+
+        aux_loss = None
+        aux_prefix_losses = [math.nan] * self.num_hpge_prefixes
+        if self.lambda_interaction > 0.0:
+            aux_loss, aux_prefix_losses = self.calculate_interaction_aux_loss(
+                e_lar=e_lar,
+                e_hpge=e_hpge,
+                ge_group_ex_idx=ge_group_ex_idx,
+                ge_group_hpge_pos=ge_group_hpge_pos,
+                ge_group_valid=ge_group_valid
+            )
+
+        denom = self.lambda_main + self.lambda_interaction
+        if denom == 0.0:
+            raise RuntimeError("Both lambda_main and lambda_interaction are zero.")
+
+        if self.lambda_main > 0.0 and self.lambda_interaction > 0.0:
+            total_loss = (
+                self.lambda_main * main_loss + self.lambda_interaction * aux_loss
+            ) / denom
+        elif self.lambda_main > 0.0:
+            total_loss = main_loss
+        else:
+            total_loss = aux_loss
+
+        aux_loss_scalar = aux_loss.detach().item() if aux_loss is not None else math.nan
+        return total_loss, main_prefix_losses, aux_loss_scalar, aux_prefix_losses
 
     def train_batch(self, *args, **kwargs):
-        loss, prefix_losses = self.forward_batch(*args, **kwargs)
+        loss, prefix_losses, aux_loss, aux_prefix_losses = self.forward_batch(*args, **kwargs)
         self.model_opt.zero_grad()
         loss.backward()
         self.model_opt.step()
-        return loss.detach().item(), prefix_losses
+        return loss.detach().item(), prefix_losses, aux_loss, aux_prefix_losses
 
     def train_epoch(self):
         loss = 0.
         n_step = 0
 
+        aux_loss_sum = 0.
+        aux_n_step = 0
+
         prefix_loss_sum = [0.0] * self.num_hpge_prefixes
         prefix_loss_count = [0] * self.num_hpge_prefixes
+
+        aux_prefix_loss_sum = [0.0] * self.num_hpge_prefixes
+        aux_prefix_loss_count = [0] * self.num_hpge_prefixes
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
@@ -333,7 +513,7 @@ class NRECTrainer(TrainerBase):
             else:
                 ge_group_ex_idx, ge_group_hpge_pos, ge_group_valid = ge_group_meta
 
-            loss_, prefix_losses_ = self.train_batch(
+            loss_, prefix_losses_, aux_loss_, aux_prefix_losses_ = self.train_batch(
                 f_idx=ge_f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 f_vals=ge_f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
@@ -351,18 +531,37 @@ class NRECTrainer(TrainerBase):
             loss += loss_
             n_step += 1
 
+            if not math.isnan(aux_loss_):
+                aux_loss_sum += aux_loss_
+                aux_n_step += 1
+
             if prefix_losses_ is not None:
                 for t, v in enumerate(prefix_losses_):
                     if not math.isnan(v):
                         prefix_loss_sum[t] += v
                         prefix_loss_count[t] += 1
 
+            if aux_prefix_losses_ is not None:
+                for t, v in enumerate(aux_prefix_losses_):
+                    if not math.isnan(v):
+                        aux_prefix_loss_sum[t] += v
+                        aux_prefix_loss_count[t] += 1
+
         n_step = 1 / n_step
         self.train_loss.append(loss * n_step)
+
+        if aux_n_step > 0:
+            self.train_aux_loss.append(aux_loss_sum / aux_n_step)
+        else:
+            self.train_aux_loss.append(math.nan)
 
         if self.config.deep_supervision == 1:
             self.train_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
+                for t in range(self.num_hpge_prefixes)
+            ])
+            self.train_aux_prefix_losses.append([
+                aux_prefix_loss_sum[t] / aux_prefix_loss_count[t] if aux_prefix_loss_count[t] > 0 else math.nan
                 for t in range(self.num_hpge_prefixes)
             ])
 
@@ -374,8 +573,14 @@ class NRECTrainer(TrainerBase):
         loss = 0.
         n_step = 0
 
+        aux_loss_sum = 0.
+        aux_n_step = 0
+
         prefix_loss_sum = [0.0] * self.num_hpge_prefixes
         prefix_loss_count = [0] * self.num_hpge_prefixes
+
+        aux_prefix_loss_sum = [0.0] * self.num_hpge_prefixes
+        aux_prefix_loss_count = [0] * self.num_hpge_prefixes
 
         for (lar, hpge), _ in self.dataloader:
             (_, t_idx, s_idx, v_val, cu_seqlens, max_seqlen, _) = lar
@@ -388,7 +593,7 @@ class NRECTrainer(TrainerBase):
             else:
                 ge_group_ex_idx, ge_group_hpge_pos, ge_group_valid = ge_group_meta
 
-            loss_, prefix_losses_ = self.forward_batch(
+            loss_, prefix_losses_, aux_loss_, aux_prefix_losses_ = self.forward_batch(
                 f_idx=ge_f_idx.to(device=self.device, non_blocking=True).to(dtype=torch.long),
                 f_vals=ge_f_vals.to(device=self.device, non_blocking=True).to(dtype=torch.float32),
                 ge_cu_seqlens=ge_cu_seqlens.to(device=self.device, non_blocking=True).to(dtype=torch.long),
@@ -406,18 +611,37 @@ class NRECTrainer(TrainerBase):
             loss += loss_.detach().item()
             n_step += 1
 
+            if not math.isnan(aux_loss_):
+                aux_loss_sum += aux_loss_
+                aux_n_step += 1
+
             if prefix_losses_ is not None:
                 for t, v in enumerate(prefix_losses_):
                     if not math.isnan(v):
                         prefix_loss_sum[t] += v
                         prefix_loss_count[t] += 1
 
+            if aux_prefix_losses_ is not None:
+                for t, v in enumerate(aux_prefix_losses_):
+                    if not math.isnan(v):
+                        aux_prefix_loss_sum[t] += v
+                        aux_prefix_loss_count[t] += 1
+
         n_step = 1 / n_step
         self.val_loss.append(loss * n_step)
+
+        if aux_n_step > 0:
+            self.val_aux_loss.append(aux_loss_sum / aux_n_step)
+        else:
+            self.val_aux_loss.append(math.nan)
 
         if self.config.deep_supervision == 1:
             self.val_prefix_losses.append([
                 prefix_loss_sum[t] / prefix_loss_count[t] if prefix_loss_count[t] > 0 else math.nan
+                for t in range(self.num_hpge_prefixes)
+            ])
+            self.val_aux_prefix_losses.append([
+                aux_prefix_loss_sum[t] / aux_prefix_loss_count[t] if aux_prefix_loss_count[t] > 0 else math.nan
                 for t in range(self.num_hpge_prefixes)
             ])
 
