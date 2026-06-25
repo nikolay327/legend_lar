@@ -1,27 +1,64 @@
 [build-system]
-requires = [
-    "setuptools>=42.0.0",
-    "wheel"
-]
-
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "legend_lar"
+name = "legend-lar"
 version = "0.1.0"
+description = "Conditional neural ratio estimation tools for sparse LAr/HPGe-style detector observables."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 authors = [
-  { name="Niko Nanda Putra Nila Lay", email="nikonandap.lay@tum.de" }
+    { name = "Niko Nanda Putra Nila Lay", email = "nikonandap.lay@tum.de" }
 ]
-license = { file="LICENSE" }
+
+keywords = [
+    "scientific-machine-learning",
+    "neural-ratio-estimation",
+    "contrastive-learning",
+    "uncertainty-quantification",
+    "detector-data",
+    "pytorch"
+]
+
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics"
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "pyyaml",
+    "lgdo"
+]
+
+[project.optional-dependencies]
+cuda = [
+    "flash-attn"
+]
+
+optim = [
+    "bitsandbytes"
+]
+
+dev = [
+    "pytest",
+    "ruff"
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["legend_lar*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
