@@ -116,7 +116,7 @@ class NRECCalibrator:
 
         collate_fn = NRECCollateFn(
             cls_placeholder_id=self.config.cls_placeholder_id,
-            has_cls=self.config.deep_supervision!=1,
+            has_cls=True,#self.config.deep_supervision!=1,
             sipm_unbinned_pe=self.config.sipm_unbinned_pe==1,
             cuda_device=self.device
         )
