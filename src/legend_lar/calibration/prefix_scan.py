@@ -259,7 +259,6 @@ class NRECPrefixScanEngine:
             max_seqlen=max_seqlen,
             geom_tokenizer=model.geom_tokenizer
         )
-        e_lar = F.normalize(e_lar, p=2, dim=-1)
         return e_lar
 
     @torch.no_grad()
@@ -282,7 +281,6 @@ class NRECPrefixScanEngine:
             max_seqlen=ge_max_seqlen,
             geom_tokenizer=model.geom_tokenizer
         )
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1)
 
         n_grid = int(ge_cu_seqlens.numel() - 1)
         D = e_hpge.shape[-1]

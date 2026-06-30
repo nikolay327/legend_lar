@@ -328,8 +328,6 @@ class NRECCalibrator:
             ge_max_seqlen=ge_max_seqlen
         )
 
-        e_lar = F.normalize(e_lar, p=2, dim=-1)
-
         if e_hpge is None:
             selected_t = None
         else:
@@ -344,8 +342,6 @@ class NRECCalibrator:
                 # For non-deep-supervision, log the rightmost available raw feature id
                 last_pos = ge_cu_seqlens[1:].to(torch.long) - 1
                 selected_t = f_idx.index_select(0, last_pos)
-
-            e_hpge = F.normalize(e_hpge, p=2, dim=-1)
 
         return e_lar, e_hpge, selected_t
 

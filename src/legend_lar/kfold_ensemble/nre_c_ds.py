@@ -416,9 +416,6 @@ class NRECTrainer(TrainerBase):
             ge_max_seqlen=ge_max_seqlen
         )
 
-        e_lar = F.normalize(e_lar, p=2, dim=-1)
-        e_hpge = F.normalize(e_hpge, p=2, dim=-1)
-
         K = self.config.K
         if self.config.deep_supervision == 0:
             if self.lambda_interaction > 0.0:
