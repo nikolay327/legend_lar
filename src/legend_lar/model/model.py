@@ -60,7 +60,8 @@ class NREC(nn.Module):
         f_idx: Tensor = None, # (N_valid,)
         f_vals: Tensor = None, # (N_valid,)
         ge_cu_seqlens: Tensor = None, # (B/2+1,)
-        ge_max_seqlen: int = None
+        ge_max_seqlen: int = None,
+        pre_cumsum: bool = False
     ):
         e_lar = self.lar_encoder(
             t_idx=t_idx,
@@ -79,7 +80,8 @@ class NREC(nn.Module):
                 f_vals=f_vals,
                 cu_seqlens=ge_cu_seqlens,
                 max_seqlen=ge_max_seqlen,
-                geom_tokenizer=self.geom_tokenizer
+                geom_tokenizer=self.geom_tokenizer,
+                pre_cumsum=pre_cumsum
             ) # (B/2, D)
 
         return e_lar, e_hpge

@@ -6,6 +6,9 @@ from legend_lar.utils import NRECConfig
 from legend_lar.model.cls import create_block
 from legend_lar.model.tokenizer import ContinuousFourierTokenizer, DetectorGeometryFeatureTable, GeometryTokenizer
 from legend_lar.model.pos_embedding import SinPositionalEmbedding
+from legend_lar.model.transforms import AsinhTransform
+from legend_lar.model.segment_cumsum import PackedSegmentCumsum
+from legend_lar.kernels import SegmentCumsumConfig
 
 class LArEncoder(nn.Module):
     def __init__(
@@ -132,6 +135,8 @@ class UnbinnedLArEncoder(nn.Module):
             device=device
         )
 
+        self.transform = AsinhTransform()
+
         self.pe_emb = ContinuousFourierTokenizer(
             emb_dim=self.config.hidden_size,
             mlp_hidden_dim=self.config.intermediate_size,
@@ -142,7 +147,7 @@ class UnbinnedLArEncoder(nn.Module):
         self.norm_in = nn.LayerNorm(self.config.hidden_size)
         self.proj_in = nn.Sequential(
             nn.Linear(self.config.hidden_size, self.config.intermediate_size),
-            nn.GELU(approximate="tanh"),
+            nn.GELU(approximate="none"),
             nn.Linear(self.config.intermediate_size, self.config.hidden_size)
         )
 
@@ -152,13 +157,7 @@ class UnbinnedLArEncoder(nn.Module):
             create_block(self.config) for _ in range(self.config.sipm_num_layers)
         ])
 
-        self.norm = nn.LayerNorm(self.config.hidden_size)
-
-        self.proj_out = nn.Sequential(
-            nn.Linear(self.config.hidden_size, self.config.intermediate_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(self.config.intermediate_size, self.config.hidden_size)
-        )
+        self.proj_out = nn.Linear(self.config.hidden_size, self.config.bilinear_low_rank_dim, bias=False)
 
     def forward(
         self,
@@ -176,8 +175,7 @@ class UnbinnedLArEncoder(nn.Module):
         non_cls_mask = ~cls_mask
 
         non_cls_det_hits = s_idx[non_cls_mask]
-        non_cls_time_hits = t_idx[non_cls_mask]
-        non_cls_num_pes = v_val[non_cls_mask]
+        non_cls_num_pes = self.transform(v_val[non_cls_mask])
 
         # detector hits tokenizer
         r_tokens, phi_tokens, z_tokens = self.geometry_table(non_cls_det_hits)
@@ -185,7 +183,7 @@ class UnbinnedLArEncoder(nn.Module):
         # residual detectorwise-information
         tokens = tokens + self.det_emb(non_cls_det_hits)
         # time information
-        tokens = self.time_emb(tokens, non_cls_time_hits)
+        tokens = self.time_emb(tokens, t_idx[non_cls_mask])
         # num of pes
         tokens = tokens + self.pe_emb(non_cls_num_pes)
 
@@ -218,7 +216,7 @@ class UnbinnedLArEncoder(nn.Module):
             )
 
         # CLS pooling: first token in each packed sequence
-        new_tokens = self.norm(residual[cls_pos].float() + new_tokens[cls_pos].float()) # (B, D)
+        new_tokens = residual[cls_pos].float() + new_tokens[cls_pos].float() # (B, D)
         new_tokens = self.proj_out(new_tokens)
 
         return new_tokens # (B, D)
@@ -368,6 +366,8 @@ class CausalHPGeEncoder(nn.Module):
         else:
             self.partitioning_emb = None
 
+
+        self.transform = AsinhTransform()
         self.features_tokenizers = nn.ModuleList([
             ContinuousFourierTokenizer(
                 emb_dim=self.config.hidden_size,
@@ -383,7 +383,7 @@ class CausalHPGeEncoder(nn.Module):
         self.norm_in = nn.LayerNorm(self.config.hidden_size)
         self.proj_in = nn.Sequential(
             nn.Linear(self.config.hidden_size, self.config.intermediate_size),
-            nn.GELU(approximate="tanh"),
+            nn.GELU(approximate="none"),
             nn.Linear(self.config.intermediate_size, self.config.hidden_size)
         )
 
@@ -391,12 +391,10 @@ class CausalHPGeEncoder(nn.Module):
             create_block(self.config, True) for _ in range(self.config.hpge_num_layers)
         ])
 
-        self.norm = nn.LayerNorm(self.config.hidden_size)
+        self.proj_out = nn.Linear(self.config.hidden_size, self.config.bilinear_low_rank_dim, bias=False)
 
-        self.proj_out = nn.Sequential(
-            nn.Linear(self.config.hidden_size, self.config.intermediate_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(self.config.intermediate_size, self.config.hidden_size)
+        self.cumsum = PackedSegmentCumsum(
+            config=SegmentCumsumConfig(autotune=True)
         )
 
     def _tokenize_continuous_features(
@@ -429,7 +427,8 @@ class CausalHPGeEncoder(nn.Module):
         f_vals: Tensor, # (N_valid,)
         cu_seqlens: Tensor, # (B+1,)
         max_seqlen: int,
-        geom_tokenizer: GeometryTokenizer
+        geom_tokenizer: GeometryTokenizer,
+        pre_cumsum: bool = False
     ) -> Tensor:
         device = self.det_emb.weight.device
         dtype = self.det_emb.weight.dtype
@@ -453,7 +452,7 @@ class CausalHPGeEncoder(nn.Module):
         geom_tokens = geom_tokenizer(r_tokens, phi_tokens, z_tokens)
         geom_tokens = geom_tokens + self.det_emb(gid)
 
-        feat_vals = f_vals[feat_mask]
+        feat_vals = self.transform(f_vals[feat_mask])
         feat_local_idx = f_idx[feat_mask] - feats_start
 
         feat_emb = self._tokenize_continuous_features(
@@ -496,11 +495,15 @@ class CausalHPGeEncoder(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
-        tokens = self.norm(residual.float() + tokens.float())
+        tokens = residual.float() + tokens.float()
         tokens = self.proj_out(tokens)
 
         if self.config.deep_supervision == 0:
             last_pos = cu_seqlens[1:].to(torch.long) - 1
             tokens = tokens.index_select(0, last_pos)
+        else:
+            if pre_cumsum:
+                return tokens
+            tokens = self.cumsum(tokens, cu_seqlens, max_seqlen)
 
         return tokens
