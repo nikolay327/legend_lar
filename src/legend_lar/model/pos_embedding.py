@@ -20,6 +20,12 @@ class SinPositionalEmbedding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
 
         self.register_buffer('pe', pe) # (L, D)
+
+        self.proj = nn.Sequential(
+            nn.Linear(emb_dim, 2 * emb_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(2 * emb_dim, emb_dim)
+        )
     
     def forward(self, x: Tensor, ids: Tensor):
-        return x + self.pe[ids]
+        return x + self.proj(self.pe[ids])
