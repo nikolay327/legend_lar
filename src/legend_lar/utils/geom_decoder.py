@@ -6,7 +6,11 @@ import pandas as pd
 import torch
 
 from .configs import NRECConfig
+from legend_lar.model.transforms import AsinhTransform
 
+TRANSFORM = AsinhTransform()
+
+@torch.no_grad()
 def decode_geom(
     cfg_yaml: str,
     config: NRECConfig
@@ -21,7 +25,14 @@ def decode_geom(
 
     hpge_detector_coords = cfg_yaml[cfg_yaml["id"] < config.num_hpges][["r", "phi", "z"]].to_numpy()
     lar_detector_coords = cfg_yaml[cfg_yaml["id"] >= config.num_hpges][["r", "phi", "z"]].to_numpy()
+
     hpge_detector_coords = torch.from_numpy(hpge_detector_coords).float()
     lar_detector_coords = torch.from_numpy(lar_detector_coords).float()
+
+    hpge_detector_coords[:, 0] = TRANSFORM(hpge_detector_coords[:, 0])
+    hpge_detector_coords[:, 2] = TRANSFORM(hpge_detector_coords[:, 2])
+
+    lar_detector_coords[:, 0] = TRANSFORM(lar_detector_coords[:, 0])
+    lar_detector_coords[:, 2] = TRANSFORM(lar_detector_coords[:, 2])
 
     return lar_detector_coords, hpge_detector_coords
