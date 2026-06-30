@@ -30,6 +30,7 @@ class NRECConfig:
     block_resid_dropout2: float = None
     attn_dropout: float = None
     cls_placeholder_id: int = None
+    bilinear_low_rank_dim: int = None
 
     # Geometry table general config
     num_rz_bands: int = None
@@ -66,7 +67,7 @@ class NRECConfig:
     hpge_feats_std: list[float] = None
     subpartition_hpge_feats: int = None
 
-    sipm_pe_scale: float = 1.0
+    sipm_pe_scale: float = None
 
     # Training hyperparams
     local_batch_size: int = None
