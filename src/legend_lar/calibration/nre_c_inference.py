@@ -287,16 +287,32 @@ class NRECCalibrator:
         ge_f_idx: Tensor, # (N_packed,)
         ge_cu_seqlens: Tensor # (B + 1,)
     ):
-        selected_pos = ge_cu_seqlens[1:].to(torch.long) - 1 # (B,)
-        if self.max_t >= 0:
-            pos_t = (ge_f_idx == self.max_t).nonzero(as_tuple=True)[0]
-            if pos_t.numel() > 0:
-                ex_t = ge_b_idx.index_select(0, pos_t)
-                selected_pos[ex_t] = pos_t
+        sos_pos = ge_cu_seqlens[:-1].to(torch.long) # (B,)
+        last_pos = ge_cu_seqlens[1:].to(torch.long) - 1 # (B,)
 
-        selected_t = ge_f_idx.index_select(0, selected_pos)
-        selected_e = e_hpge.index_select(0, selected_pos) # (B, D)
+        if self.max_t < 0:
+            selected_pos = last_pos
 
+        elif self.max_t == 0:
+            selected_pos = sos_pos
+
+        else:
+            # Select the rightmost observed raw HPGe feature with feature index < max_t.
+            selected_pos = sos_pos.clone()
+
+            valid_pos = (ge_f_idx < self.max_t).nonzero(as_tuple=True)[0]
+
+            if valid_pos.numel() > 0:
+                valid_b = ge_b_idx.index_select(0, valid_pos)
+                selected_pos[valid_b] = valid_pos
+
+        selected_t = torch.empty_like(selected_pos)
+
+        is_sos = selected_pos == sos_pos
+        selected_t[is_sos] = 0
+        selected_t[~is_sos] = ge_f_idx.index_select(0, selected_pos[~is_sos]) + 1
+
+        selected_e = e_hpge.index_select(0, selected_pos)
         return selected_e, selected_t
 
     def model_forward(self, model: NREC, lar, hpge):
@@ -684,7 +700,17 @@ if __name__ == "__main__":
     parser.add_argument("dataflow_dir", type=str, help="Directory of the dataflow")
     parser.add_argument("batch_size", type=int, help="Batch size")
     parser.add_argument("cache_dir", type=str, help="Directory to store numba, torch.inductor and triton cache")
-    parser.add_argument("--max_t", type=int, default=-1, help="Raw HPGe prefix to use at inference. -1 means rightmost available raw prefix")
+    parser.add_argument(
+        "--max_t",
+        type=int,
+        default=-1,
+        help=(
+            "HPGe prefix cutoff for deep-supervision inference. "
+            "-1 uses the full/rightmost available prefix; "
+            "0 uses the SOS/empty prefix; "
+            "k>0 uses the rightmost observed raw HPGe feature with feature index < k."
+        ),
+    )
     args = parser.parse_args()
 
     main(
