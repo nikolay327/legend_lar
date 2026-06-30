@@ -53,8 +53,8 @@ def create_base_dataset(
         partition=partition,
         filename="lib_phy.lh5"
     )
-    phy_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
-    mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
+    phy_classical_classifier = lh5.read_as("phy/coincident/spms", path, library="np").astype(bool)
+    mask = lh5.read_as("phy/spms/energy_sum", path, library="np")
     mask = (mask > 0) & (mask < 500)
     phy_classical_classifier = phy_classical_classifier[mask]
     np.save(
@@ -66,7 +66,7 @@ def create_base_dataset(
         ), phy_classical_classifier
     )
 
-    # sg training and calibration data
+    # sg training, coverage, and calibration data
     rng = np.random.default_rng(seed=data_config["rng_seed_calib_selection"])
     sipm_data_sparse_fp = file_db.build_file(
         tier="dataset",
@@ -74,24 +74,89 @@ def create_base_dataset(
         filename="sipm_data_sparse_fp.npz"
     )
     sipm_data_sparse_fp = load_npz(sipm_data_sparse_fp)
+
     indices = rng.permutation(sipm_data_sparse_fp.shape[0])
 
-    calibration_indices = indices[: 2 * data_config["num_calib_data"]] # factor 2 because of additional global calibration
-    training_indices = indices[2 * data_config["num_calib_data"]: ]
+    num_rc_coverage_data = data_config["num_rc_coverage_data"]
+    num_calib_data = data_config["num_calib_data"]
+
+    n_reserved = num_rc_coverage_data + 2 * num_calib_data
+    if sipm_data_sparse_fp.shape[0] < n_reserved:
+        raise ValueError(
+            "Not enough FP RC data for coverage + calibration: "
+            f"have {sipm_data_sparse_fp.shape[0]}, need {n_reserved} "
+            f"= num_rc_coverage_data({num_rc_coverage_data}) "
+            f"+ 2*num_calib_data({2 * num_calib_data})"
+        )
+
+    # First reserve RC coverage/test data.
+    coverage_indices = indices[:num_rc_coverage_data]
+
+    # Then reserve calibration data.
+    calibration_indices = indices[
+        num_rc_coverage_data : num_rc_coverage_data + 2 * num_calib_data
+    ]
+
+    # Everything left is used for training.
+    training_indices = indices[num_rc_coverage_data + 2 * num_calib_data :]
 
     path = file_db.build_file(
         tier="dataset",
         partition=partition,
         filename="lib_rc_fp.lh5"
     )
-    sipm_fp_classical_classifier = lh5.read_as("evt/coincident/spms", path, library="np").astype(bool)
+    sipm_fp_classical_classifier = lh5.read_as(
+        "evt/coincident/spms", path, library="np"
+    ).astype(bool)
     mask = lh5.read_as("evt/spms/energy_sum", path, library="np")
     mask = (mask > 0) & (mask < 500)
     sipm_fp_classical_classifier = sipm_fp_classical_classifier[mask]
-    
-    # calibration
+
+    # ------------------------------------------------------------------
+    # coverage / test data
+    # ------------------------------------------------------------------
+    sipm_data_sparse_coverage = sipm_data_sparse_fp[coverage_indices]
+    sipm_data_sparse_coverage_classical_classifier = (
+        sipm_fp_classical_classifier[coverage_indices]
+    )
+
+    path = file_db.build_file(
+        tier="coverage_dataset",
+        partition=partition,
+        version="base",
+        filename="sipm_data_sparse_rc_coverage.npz"
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    sp.sparse.save_npz(path, sipm_data_sparse_coverage)
+
+    np.save(
+        file_db.build_file(
+            tier="coverage_dataset",
+            partition=partition,
+            version="base",
+            filename="classical_classifier_rc_coverage.npy"
+        ),
+        sipm_data_sparse_coverage_classical_classifier
+    )
+
+    np.save(
+        file_db.build_file(
+            tier="coverage_dataset",
+            partition=partition,
+            version="base",
+            filename="indices_rc_coverage.npy"
+        ),
+        coverage_indices
+    )
+
+    # ------------------------------------------------------------------
+    # calibration data
+    # ------------------------------------------------------------------
     sipm_data_sparse_calibration = sipm_data_sparse_fp[calibration_indices]
-    sipm_data_sparse_calibration_classical_classifier = sipm_fp_classical_classifier[calibration_indices]
+    sipm_data_sparse_calibration_classical_classifier = (
+        sipm_fp_classical_classifier[calibration_indices]
+    )
+
     path = file_db.build_file(
         tier="inference_dataset",
         partition=partition,
@@ -99,22 +164,29 @@ def create_base_dataset(
         filename="sipm_data_sparse_rc_ev_ep.npz"
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    sp.sparse.save_npz(path, sipm_data_sparse_calibration[: data_config["num_calib_data"]])
+    sp.sparse.save_npz(
+        path,
+        sipm_data_sparse_calibration[:num_calib_data]
+    )
+
     np.save(
         file_db.build_file(
             tier="inference_dataset",
             partition=partition,
             version="base",
             filename="classical_classifier_rc_ev_ep.npy"
-        ), sipm_data_sparse_calibration_classical_classifier[: data_config["num_calib_data"]]
+        ),
+        sipm_data_sparse_calibration_classical_classifier[:num_calib_data]
     )
+
     np.save(
         file_db.build_file(
             tier="inference_dataset",
             partition=partition,
             version="base",
             filename="indices_rc_ev_ep.npy"
-        ), calibration_indices[: data_config["num_calib_data"]]
+        ),
+        calibration_indices[:num_calib_data]
     )
 
     path = file_db.build_file(
@@ -123,25 +195,34 @@ def create_base_dataset(
         version="base",
         filename="sipm_data_sparse_glob.npz"
     )
-    sp.sparse.save_npz(path, sipm_data_sparse_calibration[data_config["num_calib_data"]:])
+    sp.sparse.save_npz(
+        path,
+        sipm_data_sparse_calibration[num_calib_data:]
+    )
+
     np.save(
         file_db.build_file(
             tier="inference_dataset",
             partition=partition,
             version="base",
             filename="classical_classifier_glob.npy"
-        ), sipm_data_sparse_calibration_classical_classifier[data_config["num_calib_data"]:]
+        ),
+        sipm_data_sparse_calibration_classical_classifier[num_calib_data:]
     )
+
     np.save(
         file_db.build_file(
             tier="inference_dataset",
             partition=partition,
             version="base",
             filename="indices_glob.npy"
-        ), calibration_indices[data_config["num_calib_data"]:]
+        ),
+        calibration_indices[num_calib_data:]
     )
 
-    # training
+    # ------------------------------------------------------------------
+    # training data
+    # ------------------------------------------------------------------
     sipm_data_sparse_fp = sipm_data_sparse_fp[training_indices]
     sipm_fp_classical_classifier = sipm_fp_classical_classifier[training_indices]
 
