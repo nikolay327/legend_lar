@@ -228,6 +228,121 @@ The implementation supports:
 
 The deep-supervision training code is implemented mainly in `legend_lar.kfold_ensemble.nre_c_ds`. The packed segmented cumulative-sum operation is implemented with custom Triton kernels in `legend_lar.kernels` and wrapped by `legend_lar.model.segment_cumsum`.
 
+## Inference and empirical calibration
+
+Inference converts ensemble scores into empirical p-values by comparing the observed statistics to finite null buffers.
+
+
+### Prefix selection
+
+For deep-supervision models, inference first selects which HPGe prefix embedding is used for each event. The prefix is controlled by `max_t`:
+
+- `max_t < 0`: use the full / rightmost available HPGe prefix;
+- `max_t = 0`: use the SOS / empty-prefix embedding;
+- `max_t = k > 0`: use the rightmost observed raw HPGe feature with feature index smaller than $k$.
+
+The selected prefix index is saved as `t_used`.
+
+
+### Ensemble evidence and epistemic statistics
+
+For an event with LAr observables $x$ and selected HPGe prefix $c_{\leq t}$, each ensemble member $m$ produces a score
+
+$$T_m(x,c_{\leq t})=\frac{\langle z^{(m)}_x,h^{(m)}_t\rangle}{\tau}.$$
+
+The evidence statistic is the ensemble-mean score,
+
+$$T_{\mathrm{evidence}}(x,c_{\leq t})=\frac{1}{M}\sum_{m=1}^{M}T_m(x,c_{\leq t}),
+$$
+
+where $M$ is the number of ensemble members. The epistemic statistic is the ensemble variance,
+
+$$T_{\mathrm{epistemic}}(x,c_{\leq t})=\textbf{Var}_{m}\left[T_m(x,c_{\leq t})\right].$$
+
+The evidence statistic measures how large the learned log-ratio score is on average across the ensemble. The epistemic statistic measures how much the ensemble members disagree on the score.
+
+
+### Event-level empirical p-values
+
+For each physical event, the selected HPGe prefix embedding is held fixed and compared against LAr embeddings from an event-level null buffer. Let
+
+$$T^{(r)}_{\mathrm{null}}(c_{\leq t})$$
+
+denote the evidence statistic obtained by pairing the event's HPGe prefix with null LAr sample $r$. Similarly, let
+
+$$U^{(r)}_{\mathrm{null}}(c_{\leq t})$$
+
+denote the corresponding epistemic statistic under the same null pairing.
+
+The empirical evidence p-value is the upper-tail rank of the observed evidence statistic under this event-level null distribution,
+
+$$p_{\mathrm{evidence}}=\frac{1+\sum_{r=1}^{N_{\mathrm{null}}}\mathbf{1}\left[T^{(r)}_{\mathrm{null}}\geq T_{\mathrm{evidence}}\right]}{N_{\mathrm{null}}+1}.$$
+
+The empirical epistemic p-value is computed analogously from the ensemble-variance statistic,
+
+$$p_{\mathrm{epistemic}}=\frac{1+\sum_{r=1}^{N_{\mathrm{null}}}\mathbf{1}\left[U^{(r)}_{\mathrm{null}}\geq T_{\mathrm{epistemic}}\right]}{N_{\mathrm{null}}+1}.$$
+
+Here, a finite-sample empirical p-value in $(0,1]$ is used. Small $p_{\mathrm{evidence}}$ means that the observed evidence score is large compared with the event-level null distribution. Small $p_{\mathrm{epistemic}}$ means that the ensemble disagreement is unusually large compared with the null distribution.
+
+
+### Global-null calibration
+
+The inference code also evaluates a separate global-null buffer. For each event, the selected HPGe prefix is paired with many LAr samples from the global null, producing global-null evidence and epistemic statistics
+
+$$T^{(q)}_{\mathrm{glob\ null}},\qquad U^{(q)}_{\mathrm{glob\ null}}.$$
+
+Each global-null statistic is converted into an event-level empirical p-value using the same event-level null distribution as above,
+
+$$p^{(q)}_{\mathrm{evidence,glob\ null}}=\frac{1+\sum_{r=1}^{N_{\mathrm{null}}}\mathbf{1}\left[T^{(r)}_{\mathrm{null}}\geq T^{(q)}_{\mathrm{glob\ null}}\right]}{N_{\mathrm{null}}+1},$$
+
+and
+
+$$p^{(q)}_{\mathrm{epistemic,glob\ null}}=\frac{1+\sum_{r=1}^{N_{\mathrm{null}}}\mathbf{1}\left[U^{(r)}_{\mathrm{null}}\geq U^{(q)}_{\mathrm{glob\ null}}\right]}{N_{\mathrm{null}}+1}.$$
+
+These quantities form a global-null distribution of event-level empirical p-values.
+
+
+### Global empirical p-value
+
+If epistemic rejection is enabled, the event-level empirical p-values are combined into a global score. By default,
+
+$$T_{\mathrm{global}}=p_{\mathrm{evidence}}.$$
+
+For events that are both epistemically suspicious and flagged by the classical LAr classifier, the score is moved into a negative rejection region,
+
+$$T_{\mathrm{global}}=-1+(1-2\epsilon)\frac{p_{\mathrm{epistemic}}}{\alpha_{\mathrm{epistemic}}}+\epsilon p_{\mathrm{evidence}},$$
+
+where $\alpha_{\mathrm{epistemic}}$ is the epistemic threshold and $\epsilon$ is a small numerical constant. The same transformation is applied to the global-null empirical p-values, giving null global scores
+
+$$T^{(q)}_{\mathrm{global,null}}.$$
+
+The final global empirical p-value is the lower-tail rank of the observed global score under the global-null score distribution,
+
+$$p_{\mathrm{global}}=\frac{1+\sum_{q=1}^{N_{\mathrm{glob\ null}}}\mathbf{1}\left[T^{(q)}_{\mathrm{global,null}}\leq T_{\mathrm{global}}\right]}{N_{\mathrm{glob\ null}}+1}.$$
+
+The lower-tail convention is used because $T_{\mathrm{global}}$ is p-value-like: smaller values are more signal-like or more anomalous with respect to the calibrated global-null distribution.
+
+If epistemic rejection is disabled, the code stores
+
+$$p_{\mathrm{global}} = p_{\mathrm{evidence}}.$$
+
+
+### Saved inference quantities
+
+The inference table stores the selected prefix and the empirical calibration outputs, including
+
+- `t_used`: selected HPGe prefix;
+- `t_evidence`: ensemble-mean evidence statistic;
+- `t_epistemic`: ensemble-variance epistemic statistic;
+- `p_evidence`: event-level empirical evidence p-value;
+- `p_epistemic`: event-level empirical epistemic p-value;
+- `glob_null_p_evidence`: event-level empirical evidence p-values evaluated on global-null samples;
+- `glob_null_p_epistemic`: event-level empirical epistemic p-values evaluated on global-null samples;
+- `t_global`: combined global score, when epistemic rejection is enabled;
+- `p_global`: final global empirical p-value.
+
+The global-null empirical p-values saved by the code provide calibration and sanity-check distributions for the inference procedure. The inference code is implemented in `legend_lar.calibration.nre_c_inference`.
+
 ## Package structure
 
 ```text
